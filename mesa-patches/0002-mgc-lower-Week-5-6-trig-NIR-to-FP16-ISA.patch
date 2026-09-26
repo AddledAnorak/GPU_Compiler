@@ -1,0 +1,609 @@
+From eb87b4533f156441a19fca8d5f6e180ef92d4ed5 Mon Sep 17 00:00:00 2001
+From: AddledAnorak <ee3230967@iitd.ac.in>
+Date: Fri, 25 Sep 2026 01:45:44 +0530
+Subject: [PATCH 2/2] mgc: lower Week 5-6 trig NIR to FP16 ISA
+
+---
+ src/gallium/drivers/mgc/meson.build     |   9 +
+ src/gallium/drivers/mgc/mgc_compiler.c  | 344 +++++++++++++++++++-----
+ src/gallium/drivers/mgc/mgc_compiler.h  |   7 +-
+ src/gallium/drivers/mgc/mgc_test_trig.c |  58 ++++
+ 4 files changed, 345 insertions(+), 73 deletions(-)
+ create mode 100644 src/gallium/drivers/mgc/mgc_test_trig.c
+
+diff --git a/src/gallium/drivers/mgc/meson.build b/src/gallium/drivers/mgc/meson.build
+index 6bbf553..d35009c 100644
+--- a/src/gallium/drivers/mgc/meson.build
++++ b/src/gallium/drivers/mgc/meson.build
+@@ -34,3 +34,12 @@ mgc_test_arith = executable(
+   dependencies : [idep_nir, idep_mesautil],
+   build_by_default : false,
+ )
++
++mgc_test_trig = executable(
++  'mgc_test_trig',
++  files('mgc_test_trig.c'),
++  include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
++  link_with : [libmgc, libgallium],
++  dependencies : [idep_nir, idep_mesautil],
++  build_by_default : false,
++)
+diff --git a/src/gallium/drivers/mgc/mgc_compiler.c b/src/gallium/drivers/mgc/mgc_compiler.c
+index 04b12ae..7a2dade 100644
+--- a/src/gallium/drivers/mgc/mgc_compiler.c
++++ b/src/gallium/drivers/mgc/mgc_compiler.c
+@@ -2,7 +2,7 @@
+  *
+  * mgc_compiler.c -- NIR -> MGC-FP16-v1 assembly text. See mgc_compiler.h.
+  *
+- * Scope (Weeks 1-4 plan, Phase 4): the "Direct" arithmetic subset from
++ * Weeks 1-4 implemented the "Direct" arithmetic subset from
+  * docs/isa/nir_opcode_triage.md -- fadd/fsub/fmul/fdiv/fneg/fabs/fmin/fmax/
+  * mov, scalar constants (inlined against the 8-entry constant bank where
+  * they match, docs/isa/isa.yaml lines ~64-77, else a movi_f16 pseudo-op),
+@@ -12,17 +12,12 @@
+  * disclaimer). Anything else records an error rather than emitting wrong
+  * code.
+  *
+- * Register allocation is deliberately the simplest thing that works: one
+- * MGC scalar register per NIR SSA def, allocated upward from r0, never
+- * freed or reused, hard error past r31 (so the prototype never has to
+- * emit the regbank hi-register prefix). A real allocator is a Week 7-8
+- * concern -- see the plan. Because nir_lower_alu_to_scalar/
+- * nir_lower_load_const_to_scalar already ran (mgc_screen.c's
+- * lower_to_scalar option), and every one of the 8 captured shader traces
+- * fully flattens to a single basic block (see docs/glsl-to-nir/
+- * dictionary.md's 04_conditional/05_loop findings), a straight-line
+- * single-pass walk in source order is sufficient: every SSA def is
+- * produced before it's read.
++ * Week 5-6 adds the arithmetic, comparison and selection forms produced by
++ * Mesa's sin/cos lowering and nir_atan builder. This is still a straight-line
++ * compiler: live loops/branches and general integer bitwise operations are
++ * rejected. Dead SSA values release their registers after their last use;
++ * this lets the polynomial expressions fit in r0-r31 without pretending to
++ * implement Week 7-8's scheduling or register allocation.
+  *
+  * wait_* policy: emit the matching wait immediately after every producer
+  * that has a latency class (docs/isa/isa.yaml's latency_classes table).
+@@ -34,6 +29,7 @@
+  */
+ 
+ #include <errno.h>
++#include <math.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -55,11 +51,16 @@
+ enum mgc_val_kind {
+    MGC_VAL_REG,
+    MGC_VAL_CONST,
++   MGC_VAL_LITERAL,
++   MGC_VAL_PRED,
+ };
+ 
+ struct mgc_val {
+    enum mgc_val_kind kind;
+-   int index; /* register number, or constant-bank index */
++   int index; /* register, constant-bank, or condition-register index */
++   nir_const_value literal;
++   unsigned bit_size;
++   unsigned mask; /* 1 = FP16 sign, 2 = FP16 magnitude */
+ };
+ 
+ struct mgc_ctx {
+@@ -67,6 +68,10 @@ struct mgc_ctx {
+    char *asm_text;
+    char *error;
+    int next_reg;
++   int free_regs[32];
++   unsigned num_free_regs;
++   unsigned *uses;
++   unsigned next_cr;
+    struct mgc_val *vals; /* indexed by nir_def::index, size ssa_alloc */
+ };
+ 
+@@ -98,6 +103,8 @@ mgc_error(struct mgc_ctx *ctx, const char *fmt, ...)
+ static int
+ mgc_alloc_reg(struct mgc_ctx *ctx)
+ {
++   if (ctx->num_free_regs)
++      return ctx->free_regs[--ctx->num_free_regs];
+    if (ctx->next_reg > MGC_MAX_REGISTER) {
+       mgc_error(ctx, "mgc: out of registers (>32 SSA values); register "
+                      "allocation is a Week 7-8 deliverable, see the plan");
+@@ -106,9 +113,17 @@ mgc_alloc_reg(struct mgc_ctx *ctx)
+    return ctx->next_reg++;
+ }
+ 
++static void
++mgc_free_reg(struct mgc_ctx *ctx, int reg)
++{
++   if (reg >= 0 && reg <= MGC_MAX_REGISTER)
++      ctx->free_regs[ctx->num_free_regs++] = reg;
++}
++
+ static void
+ mgc_val_str(struct mgc_val v, char buf[8])
+ {
++   assert(v.kind == MGC_VAL_CONST || v.kind == MGC_VAL_REG);
+    if (v.kind == MGC_VAL_CONST)
+       snprintf(buf, 8, "#%d", v.index);
+    else
+@@ -135,6 +150,14 @@ static struct mgc_val
+ mgc_materialize_f16(struct mgc_ctx *ctx, float f)
+ {
+    int reg = mgc_alloc_reg(ctx);
++   if (!isfinite(f)) {
++      /* The assembler's numeric parser does not accept inf/nan tokens.
++       * Loading the FP16 bit pattern through the integer immediate path
++       * also keeps the sign and NaN payload explicit. */
++      ralloc_asprintf_append(&ctx->asm_text, "movi_i32 %u, r%d\n",
++                              _mesa_float_to_half(f), reg);
++      return (struct mgc_val){ .kind = MGC_VAL_REG, .index = reg };
++   }
+    char *lit = mgc_float_literal(ctx->mem_ctx, f);
+    ralloc_asprintf_append(&ctx->asm_text, "movi_f16 %s, r%d\n", lit, reg);
+    return (struct mgc_val){ .kind = MGC_VAL_REG, .index = reg };
+@@ -150,18 +173,33 @@ mgc_emit_load_const(struct mgc_ctx *ctx, nir_load_const_instr *load)
+       return;
+    }
+ 
+-   double d = nir_const_value_as_float(load->value[0], load->def.bit_size);
+-   float f = (float)d;
+-   uint16_t bits = _mesa_float_to_half(f);
++   /* NIR load_const has no type: the consumer decides whether these raw
++    * bits are a float, integer mask, or boolean. In particular, treating
++    * atan's 0x80000000 sign mask as a float would destroy it. */
++   ctx->vals[load->def.index] = (struct mgc_val){
++      .kind = MGC_VAL_LITERAL,
++      .literal = load->value[0],
++      .bit_size = load->def.bit_size,
++   };
++}
+ 
++static struct mgc_val
++mgc_float_val(struct mgc_ctx *ctx, nir_def *def)
++{
++   struct mgc_val *v = &ctx->vals[def->index];
++   if (v->kind != MGC_VAL_LITERAL)
++      return *v;
++
++   float f = (float)nir_const_value_as_float(v->literal, v->bit_size);
++   uint16_t bits = _mesa_float_to_half(f);
+    for (int i = 0; i < 8; i++) {
+       if (mgc_const_bank[i] == bits) {
+-         ctx->vals[load->def.index] = (struct mgc_val){ .kind = MGC_VAL_CONST, .index = i };
+-         return;
++         *v = (struct mgc_val){ .kind = MGC_VAL_CONST, .index = i };
++         return *v;
+       }
+    }
+-
+-   ctx->vals[load->def.index] = mgc_materialize_f16(ctx, f);
++   *v = mgc_materialize_f16(ctx, f);
++   return *v;
+ }
+ 
+ struct mgc_alu_op_info {
+@@ -183,6 +221,7 @@ static const struct mgc_alu_op_info mgc_alu_ops[] = {
+    { nir_op_fmax, "fmax16", "wait_short", true },
+    { nir_op_fneg, "fneg16", NULL, false },
+    { nir_op_fabs, "fabs16", NULL, false },
++   { nir_op_ffloor, "floor16", "wait_short", false },
+    { nir_op_mov,  "copy",   NULL, false },
+ };
+ 
+@@ -195,70 +234,189 @@ mgc_find_alu_op(nir_op op)
+    return NULL;
+ }
+ 
++static void
++mgc_emit_binary(struct mgc_ctx *ctx, const char *op, const char *wait,
++                struct mgc_val a, struct mgc_val b, int dst, bool commutative)
++{
++   int temp = -1;
++   if (b.kind == MGC_VAL_CONST) {
++      if (commutative) {
++         struct mgc_val swap = a;
++         a = b;
++         b = swap;
++      }
++      if (b.kind == MGC_VAL_CONST) {
++         b = mgc_materialize_f16(ctx, _mesa_half_to_float(mgc_const_bank[b.index]));
++         temp = b.index;
++      }
++   }
++   char abuf[8], bbuf[8];
++   mgc_val_str(a, abuf);
++   mgc_val_str(b, bbuf);
++   ralloc_asprintf_append(&ctx->asm_text, "%s %s, %s, r%d\n", op, abuf, bbuf, dst);
++   if (wait)
++      ralloc_asprintf_append(&ctx->asm_text, "%s\n", wait);
++   mgc_free_reg(ctx, temp);
++}
++
+ static void
+ mgc_emit_alu(struct mgc_ctx *ctx, nir_alu_instr *alu)
+ {
+    const struct mgc_alu_op_info *info = mgc_find_alu_op(alu->op);
+-   unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
+-
+-   if (!info) {
+-      mgc_error(ctx, "mgc: unsupported NIR ALU op '%s' -- see "
+-                     "docs/isa/nir_opcode_triage.md for which bucket it "
+-                     "falls in and what Week it's scoped for",
+-                nir_op_infos[alu->op].name);
+-      return;
+-   }
+    if (alu->def.num_components != 1) {
+-      mgc_error(ctx, "mgc: '%s' with %d components reached the backend -- "
+-                     "nir_lower_alu_to_scalar should have prevented this",
+-                info->mnem, alu->def.num_components);
++      mgc_error(ctx, "mgc: '%s' with %d components reached the backend",
++                nir_op_infos[alu->op].name, alu->def.num_components);
+       return;
+    }
+ 
+-   int dst = mgc_alloc_reg(ctx);
+-
+-   if (num_inputs == 1) {
+-      /* copy/fabs16/fneg16 all accept a const-bank srcA directly
+-       * (isa.yaml: operands: [srcA, dst]), so no swap/materialize logic
+-       * is needed here the way the two-operand case below needs it. */
+-      struct mgc_val a = ctx->vals[alu->src[0].src.ssa->index];
+-      char abuf[8];
+-      mgc_val_str(a, abuf);
+-      ralloc_asprintf_append(&ctx->asm_text, "%s %s, r%d\n", info->mnem, abuf, dst);
+-   } else {
+-      struct mgc_val a = ctx->vals[alu->src[0].src.ssa->index];
+-      struct mgc_val b = ctx->vals[alu->src[1].src.ssa->index];
+-
+-      /* Only srcA can be a constant-bank operand (isa.yaml bit 21,
+-       * srcA_select). For a commutative op, swap operands so any
+-       * constant lands in srcA. For a non-commutative op with the
+-       * constant in srcB, materialize it into a register instead. */
++   nir_def *s0 = alu->src[0].src.ssa;
++   struct mgc_val a, b;
++   int dst;
++
++   /* The GLSL atan builder emits a compare and two selects. Keep the
++    * boolean in a condition register rather than pretending it is FP16. */
++   const char *cmp = NULL;
++   switch (alu->op) {
++   case nir_op_flt: cmp = "fcomp_l"; break;
++   case nir_op_feq: cmp = "fcomp_e"; break;
++   case nir_op_fge: cmp = "fcomp_ge"; break;
++   case nir_op_fneu: cmp = "fcomp_ne"; break;
++   default: break;
++   }
++   if (cmp) {
++      if (ctx->next_cr >= 8) {
++         mgc_error(ctx, "mgc: more than eight live FP comparisons");
++         return;
++      }
++      a = mgc_float_val(ctx, s0);
++      b = mgc_float_val(ctx, alu->src[1].src.ssa);
++      int temp = -1;
+       if (b.kind == MGC_VAL_CONST) {
+-         if (info->commutative) {
+-            struct mgc_val t = a;
+-            a = b;
+-            b = t;
+-         } else {
+-            char lit[8];
+-            mgc_val_str(b, lit);
+-            /* lit here is "#N"; re-derive the float from the bank table
+-             * to materialize it as a real register value. */
+-            float f = _mesa_half_to_float(mgc_const_bank[b.index]);
+-            b = mgc_materialize_f16(ctx, f);
+-         }
++         b = mgc_materialize_f16(ctx, _mesa_half_to_float(mgc_const_bank[b.index]));
++         temp = b.index;
+       }
++      char abuf[8], bbuf[8];
++      mgc_val_str(a, abuf);
++      mgc_val_str(b, bbuf);
++      unsigned cr = ctx->next_cr++;
++      ralloc_asprintf_append(&ctx->asm_text, "%s %s, %s, cr%u\nwait_fcomp\n",
++                              cmp, abuf, bbuf, cr);
++      mgc_free_reg(ctx, temp);
++      ctx->vals[alu->def.index] = (struct mgc_val){ .kind = MGC_VAL_PRED, .index = cr };
++      return;
++   }
+ 
++   if (alu->op == nir_op_bcsel) {
++      struct mgc_val pred = ctx->vals[s0->index];
++      if (pred.kind != MGC_VAL_PRED) {
++         mgc_error(ctx, "mgc: bcsel requires a compare in a condition register");
++         return;
++      }
++      a = mgc_float_val(ctx, alu->src[1].src.ssa);
++      b = mgc_float_val(ctx, alu->src[2].src.ssa);
+       char abuf[8], bbuf[8];
+       mgc_val_str(a, abuf);
+       mgc_val_str(b, bbuf);
+-      ralloc_asprintf_append(&ctx->asm_text, "%s %s, %s, r%d\n",
+-                              info->mnem, abuf, bbuf, dst);
++      dst = mgc_alloc_reg(ctx);
++      ralloc_asprintf_append(&ctx->asm_text,
++                              "copy %s, r%d\ncopy.cr%d %s, r%d\n",
++                              bbuf, dst, pred.index, abuf, dst);
++      ctx->vals[alu->def.index] = (struct mgc_val){ .kind = MGC_VAL_REG, .index = dst };
++      return;
+    }
+ 
+-   if (info->wait)
+-      ralloc_asprintf_append(&ctx->asm_text, "%s\n", info->wait);
++   if (alu->op == nir_op_iand) {
++      nir_def *lhs = s0, *rhs = alu->src[1].src.ssa;
++      nir_def *mask_def = rhs->parent_instr->type == nir_instr_type_load_const
++                            ? rhs : lhs;
++      uint64_t raw = 0;
++      if (mask_def->parent_instr->type == nir_instr_type_load_const) {
++         nir_load_const_instr *load = nir_instr_as_load_const(mask_def->parent_instr);
++         raw = nir_const_value_as_uint(load->value[0], load->def.bit_size);
++      }
++      unsigned half_mask = raw == 0x80000000u || raw == 0x8000u ? 0x8000 :
++                           raw == 0x7fffffffu || raw == 0x7fffu ? 0x7fff : 0;
++      if (!half_mask) {
++         mgc_error(ctx, "mgc: iand only supports atan sign/magnitude masks");
++         return;
++      }
++      nir_def *value = mask_def == rhs ? lhs : rhs;
++      a = mgc_float_val(ctx, value);
++      char abuf[8];
++      mgc_val_str(a, abuf);
++      int mask_reg = mgc_alloc_reg(ctx);
++      dst = mgc_alloc_reg(ctx);
++      ralloc_asprintf_append(&ctx->asm_text,
++                              "movi_i32 %u, r%d\nand %s, r%d, r%d\nwait_short\n",
++                              half_mask, mask_reg, abuf, mask_reg, dst);
++      mgc_free_reg(ctx, mask_reg);
++      ctx->vals[alu->def.index] = (struct mgc_val){
++         .kind = MGC_VAL_REG, .index = dst,
++         .mask = half_mask == 0x8000 ? 1 : 2,
++      };
++      return;
++   }
+ 
+-   ctx->vals[alu->def.index] = (struct mgc_val){ .kind = MGC_VAL_REG, .index = dst };
++   if (alu->op == nir_op_ior) {
++      a = ctx->vals[s0->index];
++      b = ctx->vals[alu->src[1].src.ssa->index];
++      if (!((a.mask == 1 && b.mask == 2) || (a.mask == 2 && b.mask == 1))) {
++         mgc_error(ctx, "mgc: ior only supports disjoint atan sign/magnitude bits");
++         return;
++      }
++      dst = mgc_alloc_reg(ctx);
++      ralloc_asprintf_append(&ctx->asm_text,
++                              "add r%d, r%d, r%d\nwait_short\n",
++                              a.index, b.index, dst);
++      ctx->vals[alu->def.index] = (struct mgc_val){ .kind = MGC_VAL_REG, .index = dst };
++      return;
++   }
++
++   a = mgc_float_val(ctx, s0);
++   dst = mgc_alloc_reg(ctx);
++   if (info) {
++      if (nir_op_infos[alu->op].num_inputs == 1) {
++         char abuf[8];
++         mgc_val_str(a, abuf);
++         ralloc_asprintf_append(&ctx->asm_text, "%s %s, r%d\n", info->mnem, abuf, dst);
++         if (info->wait)
++            ralloc_asprintf_append(&ctx->asm_text, "%s\n", info->wait);
++      } else {
++         b = mgc_float_val(ctx, alu->src[1].src.ssa);
++         mgc_emit_binary(ctx, info->mnem, info->wait, a, b, dst, info->commutative);
++      }
++   } else if (alu->op == nir_op_frcp) {
++      mgc_emit_binary(ctx, "fdiv16", "wait_fdiv",
++                      (struct mgc_val){ .kind = MGC_VAL_CONST, .index = 3 }, a, dst, false);
++   } else if (alu->op == nir_op_ffract) {
++      char abuf[8];
++      mgc_val_str(a, abuf);
++      int floored = mgc_alloc_reg(ctx);
++      ralloc_asprintf_append(&ctx->asm_text, "floor16 %s, r%d\nwait_short\n",
++                              abuf, floored);
++      mgc_emit_binary(ctx, "fsub16", "wait_fadd", a,
++                      (struct mgc_val){ .kind = MGC_VAL_REG, .index = floored },
++                      dst, false);
++      mgc_free_reg(ctx, floored);
++   } else if (alu->op == nir_op_ffma) {
++      b = mgc_float_val(ctx, alu->src[1].src.ssa);
++      struct mgc_val c = mgc_float_val(ctx, alu->src[2].src.ssa);
++      int product = mgc_alloc_reg(ctx);
++      mgc_emit_binary(ctx, "fmul16", "wait_fmul", a, b, product, true);
++      mgc_emit_binary(ctx, "fadd16", "wait_fadd",
++                      (struct mgc_val){ .kind = MGC_VAL_REG, .index = product },
++                      c, dst, true);
++      mgc_free_reg(ctx, product);
++   } else {
++      mgc_error(ctx, "mgc: unsupported NIR ALU op '%s'",
++                nir_op_infos[alu->op].name);
++      mgc_free_reg(ctx, dst);
++      return;
++   }
++   ctx->vals[alu->def.index] = (struct mgc_val){
++      .kind = MGC_VAL_REG, .index = dst,
++      .mask = alu->op == nir_op_mov ? a.mask : 0,
++   };
+ }
+ 
+ static void
+@@ -272,7 +430,7 @@ mgc_emit_store_output(struct mgc_ctx *ctx, nir_intrinsic_instr *intr)
+    }
+ 
+    unsigned component = nir_intrinsic_component(intr);
+-   struct mgc_val val = ctx->vals[intr->src[0].ssa->index];
++   struct mgc_val val = mgc_float_val(ctx, intr->src[0].ssa);
+    char valbuf[8];
+    mgc_val_str(val, valbuf);
+ 
+@@ -285,11 +443,41 @@ mgc_emit_store_output(struct mgc_ctx *ctx, nir_intrinsic_instr *intr)
+    ralloc_asprintf_append(&ctx->asm_text, "movi_i32 %u, r%d\n",
+                            MGC_FRAMEBUFFER_BASE + component, addr_reg);
+    ralloc_asprintf_append(&ctx->asm_text, "store %s, r%d\n", valbuf, addr_reg);
++   mgc_free_reg(ctx, addr_reg);
++}
++
++static bool
++mgc_count_use(nir_src *src, void *data)
++{
++   struct mgc_ctx *ctx = data;
++   if (src->ssa)
++      ctx->uses[src->ssa->index]++;
++   return true;
++}
++
++static bool
++mgc_release_use(nir_src *src, void *data)
++{
++   struct mgc_ctx *ctx = data;
++   if (src->ssa && --ctx->uses[src->ssa->index] == 0) {
++      struct mgc_val v = ctx->vals[src->ssa->index];
++      if (v.kind == MGC_VAL_REG)
++         mgc_free_reg(ctx, v.index);
++   }
++   return true;
+ }
+ 
+ struct mgc_shader *
+ mgc_compile_nir(struct nir_shader *nir)
+ {
++   /* lower_sincos in our compiler options expands fsin/fcos into ffract,
++    * arithmetic, and ffma; the emitter below implements those ISA pieces. */
++   NIR_PASS(_, nir, nir_opt_algebraic);
++   NIR_PASS(_, nir, nir_opt_cse);
++   NIR_PASS(_, nir, nir_opt_dce);
++   if (getenv("MGC_NIR_DUMP"))
++      nir_print_shader(nir, stderr);
++
+    struct mgc_shader *shader = rzalloc(NULL, struct mgc_shader);
+    struct mgc_ctx ctx = {
+       .mem_ctx = shader,
+@@ -301,6 +489,18 @@ mgc_compile_nir(struct nir_shader *nir)
+ 
+    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+    ctx.vals = rzalloc_array(shader, struct mgc_val, MAX2(impl->ssa_alloc, 1));
++   ctx.uses = rzalloc_array(shader, unsigned, MAX2(impl->ssa_alloc, 1));
++
++   unsigned blocks = 0;
++   nir_foreach_block (block, impl) {
++      blocks++;
++      nir_foreach_instr (instr, block)
++         nir_foreach_src(instr, mgc_count_use, &ctx);
++   }
++   if (blocks != 1) {
++      mgc_error(&ctx, "mgc: control flow is not implemented (%u NIR blocks)", blocks);
++      goto done;
++   }
+ 
+    nir_foreach_block (block, impl) {
+       nir_foreach_instr (instr, block) {
+@@ -330,7 +530,8 @@ mgc_compile_nir(struct nir_shader *nir)
+                 * vertex output actually goes. */
+             } else {
+                mgc_error(&ctx, "mgc: unsupported NIR intrinsic '%s' -- "
+-                                "out of scope for Weeks 1-4, see the plan",
++                                "shader input/loading is not implemented; "
++                                "see docs/isa/week56_backend.md",
+                          nir_intrinsic_infos[intr->intrinsic].name);
+             }
+             break;
+@@ -342,6 +543,11 @@ mgc_compile_nir(struct nir_shader *nir)
+          }
+          if (ctx.error)
+             goto done;
++         nir_foreach_src(instr, mgc_release_use, &ctx);
++         nir_def *def = nir_instr_def(instr);
++         if (def && ctx.uses[def->index] == 0 &&
++             ctx.vals[def->index].kind == MGC_VAL_REG)
++            mgc_free_reg(&ctx, ctx.vals[def->index].index);
+       }
+    }
+ 
+diff --git a/src/gallium/drivers/mgc/mgc_compiler.h b/src/gallium/drivers/mgc/mgc_compiler.h
+index 9799da9..71f2b42 100644
+--- a/src/gallium/drivers/mgc/mgc_compiler.h
++++ b/src/gallium/drivers/mgc/mgc_compiler.h
+@@ -1,10 +1,9 @@
+ /* SPDX-License-Identifier: MIT
+  *
+  * mgc_compiler.h -- NIR -> MGC-FP16-v1 assembly text translation.
+- * Student B's Week 3-4 deliverable. Scope: the "Direct" arithmetic subset
+- * from docs/isa/nir_opcode_triage.md (fadd/fsub/fmul/fdiv/fneg/fabs/
+- * fmin/fmax/mov, plus scalar constants and a store_output epilogue) --
+- * see the Weeks 1-4 plan, Phase 4.
++ * Student B's Weeks 3-6 backend: the initial scalar arithmetic subset plus
++ * the straight-line NIR forms generated for sin, cos and atan. See
++ * docs/isa/week56_backend.md for the supported range and test commands.
+  */
+ #ifndef MGC_COMPILER_H
+ #define MGC_COMPILER_H
+diff --git a/src/gallium/drivers/mgc/mgc_test_trig.c b/src/gallium/drivers/mgc/mgc_test_trig.c
+new file mode 100644
+index 0000000..c6bcdae
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_test_trig.c
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: MIT
++ * Build a single non-folded NIR expression for each Week 5-6 function.
++ * A literal is deliberately fed directly to mgc_compile_nir: this tests
++ * the backend without requiring the still-missing uniform/attribute path.
++ * The compiler's algebraic lowering expands fsin/fcos; nir_atan is the
++ * exact Mesa builder used by the GLSL frontend.
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "compiler/nir/nir_builtin_builder.h"
++#include "compiler/shader_enums.h"
++#include "mgc_compiler.h"
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 3) {
++      fprintf(stderr, "usage: %s <sin|cos|atan|all> <input>\n", argv[0]);
++      return 2;
++   }
++   char *end;
++   float x = strtof(argv[2], &end);
++   if (!*argv[2] || *end) {
++      fprintf(stderr, "invalid float input: %s\n", argv[2]);
++      return 2;
++   }
++
++   nir_builder b = nir_builder_init_simple_shader(
++      MESA_SHADER_FRAGMENT, mgc_test_get_compiler_options(), "mgc_trig_test");
++   nir_def *input = nir_imm_float(&b, x);
++   nir_def *offset = nir_imm_int(&b, 0);
++   if (!strcmp(argv[1], "sin") || !strcmp(argv[1], "all"))
++      nir_store_output(&b, nir_fsin(&b, input), offset, .component = 0);
++   if (!strcmp(argv[1], "cos") || !strcmp(argv[1], "all"))
++      nir_store_output(&b, nir_fcos(&b, input), offset, .component = 1);
++   if (!strcmp(argv[1], "atan") || !strcmp(argv[1], "all"))
++      nir_store_output(&b, nir_atan(&b, input), offset, .component = 2);
++   if (strcmp(argv[1], "sin") && strcmp(argv[1], "cos") &&
++       strcmp(argv[1], "atan") && strcmp(argv[1], "all")) {
++      fprintf(stderr, "unknown operation: %s\n", argv[1]);
++      ralloc_free(b.shader);
++      return 2;
++   }
++
++   struct mgc_shader *shader = mgc_compile_nir(b.shader);
++   if (shader->error) {
++      fprintf(stderr, "%s\n", shader->error);
++      mgc_shader_destroy(shader);
++      return 1;
++   }
++   fputs(shader->asm_text, stdout);
++   mgc_shader_destroy(shader);
++   return 0;
++}
+-- 
+2.43.0
+

@@ -1,0 +1,304 @@
+# MGC-FP16-v1 instruction set, transcribed from FP16_ISA_V1.pdf.
+#
+# STATUS: PARTIAL / PROVISIONAL. This file is the single source of truth for
+# tools/mgcasm and tools/mgcsim. Every field marked `status: guess` is NOT in
+# the spec document and has been invented so the toolchain has something to
+# assemble/execute; see docs/isa/ENCODING_GUESSES.md for the reasoning behind
+# each guess, and docs/isa/OPEN_QUESTIONS.md for what to ask the hardware
+# author. Do not treat guessed fields as ground truth for real hardware.
+
+target: MGC-FP16-v1
+instruction_width_bits: 32
+scalar_register_width_bits: 32
+scalar_register_count: 64
+direct_register_range: [0, 31]     # r0..r31 addressable directly
+upper_register_access: regbank_prefix  # r32..r63 via one-shot 'regbank' prefix
+fp_format: fp16_ieee754_binary16
+execution_model: in_order_explicitly_scheduled
+
+# ---------------------------------------------------------------------------
+# Base 32-bit instruction field layout (Table 2). This part of the spec is
+# complete and is treated as authoritative.
+# ---------------------------------------------------------------------------
+fields:
+  - {name: opcode,       bits: [31, 27], width: 5, meaning: "Primary operation channel"}
+  - {name: cond_enable,  bits: [26, 26], width: 1, meaning: "Enables conditional execution"}
+  - {name: cond_invert,  bits: [25, 25], width: 1, meaning: "Normal (0) or inverted (1) predicate"}
+  - {name: cond_cr,      bits: [24, 22], width: 3, meaning: "Condition register index CR0..CR7"}
+  - {name: srcA_select,  bits: [21, 21], width: 1, meaning: "0 = constant bank, 1 = register"}
+  - {name: srcA,         bits: [20, 16], width: 5, meaning: "Register index or constant index"}
+  - {name: subop,        bits: [15, 10], width: 6, meaning: "Opcode-specific operation select"}
+  - {name: srcB,         bits: [9, 5],   width: 5, meaning: "Source-B register index"}
+  - {name: dst,          bits: [4, 0],   width: 5, meaning: "Destination register or CR index"}
+# "Some control-flow instructions reuse middle fields for target offsets or
+# link behavior" (spec, sec. 2). Exact reuse layout for jump/goto/call/rcall
+# is UNSPECIFIED -- see OPEN_QUESTIONS.md item 4. Provisional layout below.
+
+control_flow_target:
+  status: guess
+  # subop[15:10] must stay intact to distinguish goto (subop 0) from call
+  # (subop 1) within their shared channel 22 -- so the 22 non-opcode/cond
+  # bits available split into two chunks around it: a high 6-bit chunk
+  # (srcA_select+srcA, bits 21:16) and a low 10-bit chunk (srcB+dst, bits
+  # 9:0), concatenated into one 16-bit signed target.
+  width: 16
+  hi_chunk: {bits: [21, 16], width: 6}   # srcA_select(1) + srcA(5)
+  lo_chunk: {bits: [9, 0],   width: 10}  # srcB(5) + dst(5)
+  encoding: signed_twos_complement
+  unit: instruction_words
+  relative_to: pc_of_next_instruction
+  used_by: [goto, call]
+  note: "jump/rcall use srcA as a register operand instead (indirect form); see item 4."
+
+# ---------------------------------------------------------------------------
+# Condition registers
+# ---------------------------------------------------------------------------
+condition_registers:
+  count: 8
+  names: [CR0, CR1, CR2, CR3, CR4, CR5, CR6, CR7]
+
+# ---------------------------------------------------------------------------
+# FP16 constant bank (Table 4). Authoritative for indices 0-7.
+# Source-A is 5 bits wide (32 slots) but only 8 are documented.
+# ---------------------------------------------------------------------------
+fp16_constant_bank:
+  width_bits: 32          # 32 slots implied by the 5-bit srcA field
+  documented_entries: 8   # only indices 0-7 are given a meaning
+  entries:
+    - {index: 0, bits: 0xFC00, meaning: "Negative infinity"}
+    - {index: 1, bits: 0xBC00, meaning: "-1.0"}
+    - {index: 2, bits: 0x0000, meaning: "0.0"}
+    - {index: 3, bits: 0x3C00, meaning: "1.0"}
+    - {index: 4, bits: 0x3800, meaning: "0.5"}
+    - {index: 5, bits: 0x4248, meaning: "Pi approximation"}
+    - {index: 6, bits: 0x7C00, meaning: "Positive infinity"}
+    - {index: 7, bits: 0x7E00, meaning: "Quiet NaN"}
+    - {index: 8,  bits: null, meaning: "UNDOCUMENTED", status: guess}
+    - {index: "9-31", bits: null, meaning: "UNDOCUMENTED - reserved or writable?", status: guess}
+
+# ---------------------------------------------------------------------------
+# Primary opcode map (Tables 5 and 6). Authoritative for the 5-bit opcode
+# value and channel meaning. Sub-op values ([15:10]) that select among the
+# mnemonics listed per-channel are NOT given in the spec (see
+# OPEN_QUESTIONS.md item 1) -- provisional sub-op numbers are assigned below
+# in mnemonic definition order per channel and flagged `status: guess`.
+# ---------------------------------------------------------------------------
+opcodes:
+  0:  {bin: "00000", channel: 0,  meaning: "nop / regbank prefix / wait family",
+       mnemonics: [nop, regbank, wait, wait_short, wait_load, wait_fcomp, wait_fadd, wait_fmul, wait_fdiv, wait_conv]}
+  1:  {bin: "00001", channel: 1,  meaning: "Preload/write immediate path",       mnemonics: [movi_u16, movi_i32, movi_f16, ploadu_l, loadu_h]}
+  2:  {bin: "00010", channel: 2,  meaning: "Move and sign",                      mnemonics: [copy, fabs16, fneg16, fnabs16]}
+  3:  {bin: "00011", channel: 3,  meaning: "fmulp2_16",                          mnemonics: [fmulp2_16]}
+  4:  {bin: "00100", channel: 4,  meaning: "FP16 add/sub",                       mnemonics: [fadd16, fsub16]}
+  5:  {bin: "00101", channel: 5,  meaning: "FP16 multiply",                      mnemonics: [fmul16]}
+  6:  {bin: "00110", channel: 6,  meaning: "FP16 divide",                        mnemonics: [fdiv16]}
+  7:  {bin: "00111", channel: 7,  meaning: "FP16 min/max",                       mnemonics: [fmin16, fmax16]}
+  8:  {bin: "01000", channel: 8,  meaning: "Rounding",                           mnemonics: [trunc16, round16, ceil16, floor16]}
+  9:  {bin: "01001", channel: 9,  meaning: "f16 -> u8 conversion (4 variants)",  mnemonics: [f16tou8_ll, f16tou8_lh, f16tou8_hl, f16tou8_hh]}
+  10: {bin: "01010", channel: 10, meaning: "f16 -> u16 conversion (2 variants)", mnemonics: [f16tou16_l, f16tou16_h]}
+  11: {bin: "01011", channel: 11, meaning: "f16 -> i32 conversion",              mnemonics: [f16toi32]}
+  12: {bin: "01100", channel: 12, meaning: "u8 -> f16 conversion (4 variants)",  mnemonics: [u8tof16_ll, u8tof16_lh, u8tof16_hl, u8tof16_hh]}
+  13: {bin: "01101", channel: 13, meaning: "u16 -> f16 conversion (2 variants)", mnemonics: [u16tof16_l, u16tof16_h]}
+  14: {bin: "01110", channel: 14, meaning: "int -> f16 conversion",             mnemonics: [i32tof16, u32tof16]}
+  15: {bin: "01111", channel: 15, meaning: "FP compare-to-CR update (8 predicates)", mnemonics: [fcomp_l, fcomp_le, fcomp_e, fcomp_ge, fcomp_g, fcomp_ne, fcomp_o, fcomp_u]}
+  16: {bin: "10000", channel: 16, meaning: "Integer add/and/step/vector-set",    mnemonics: [add, and, istep4, vset4, vbcast, vadd_i32]}
+  17: {bin: "10001", channel: 17, meaning: "load_addr",                         mnemonics: [load_addr]}
+  18: {bin: "10010", channel: 18, meaning: "store_addr",                        mnemonics: [store_addr]}
+  19: {bin: "10011", channel: 19, meaning: "load / indirect load / pop",        mnemonics: [load, i_load, pop]}
+  20: {bin: "10100", channel: 20, meaning: "store / indirect store / push",     mnemonics: [store, i_store, push]}
+  21: {bin: "10101", channel: 21, meaning: "jump / rcall",                      mnemonics: [jump, rcall], control_flow: true}
+  22: {bin: "10110", channel: 22, meaning: "goto / call",                       mnemonics: [goto, call], control_flow: true}
+  23: {bin: "10111", channel: 23, meaning: "ret",                               mnemonics: [ret], control_flow: true}
+  24: {bin: "11000", channel: 24, meaning: "stop_core",                        mnemonics: [stop_core]}
+  25: {bin: "11001", channel: 25, meaning: "vector store variants",             mnemonics: [v4cr_store, v4cr_store_step, vstore_mask]}
+  26: {bin: "11010", channel: 26, meaning: "Signed integer compare-to-CR",      mnemonics: [icmp_lt, icmp_le, icmp_eq, icmp_ge, icmp_gt, icmp_ne]}
+  27: {bin: "11011", channel: 27, meaning: "v4cmp_ge_zero",                    mnemonics: [v4cmp_ge_zero]}
+  28: {bin: "11100", channel: 28, meaning: "v4cmp_ge_zero_and",                mnemonics: [v4cmp_ge_zero_and]}
+  29: {bin: "11101", channel: 29, meaning: "v4mask_to_cr / vcmp_ge_zero_i32",  mnemonics: [v4mask_to_cr, vcmp_ge_zero_i32]}
+  30: {bin: "11110", channel: 30, meaning: "v4cmp_ge_zero_step",               mnemonics: [v4cmp_ge_zero_step]}
+  31: {bin: "11111", channel: 31, meaning: "v4cmp_ge_zero_step_and_p1",        mnemonics: [v4cmp_ge_zero_step_and_p1]}
+
+
+# ---------------------------------------------------------------------------
+# Sub-op assignment. UNSPECIFIED BY THE VENDOR SPEC (see OPEN_QUESTIONS.md #1).
+# Assigned here as a stable, deterministic scheme purely so the assembler has
+# something to emit: sub-op = position of the mnemonic within its channel's
+# `mnemonics` list above, starting at 0. This guarantees a fixed point for
+# assemble->disassemble->reassemble but is almost certainly NOT what the real
+# decoder expects.
+# ---------------------------------------------------------------------------
+subop_assignment_scheme: "index-in-channel-mnemonic-list"
+subop_assignment_status: guess
+
+# ---------------------------------------------------------------------------
+# Per-mnemonic operand shape and semantics, for the ones with enough
+# information in the spec body (secs. 8, 9, 11) to be unambiguous, plus
+# provisional shapes (status: guess) for the rest, inferred from the
+# canonical mnemonic groups (Table 7) and minimal examples (sec. 11).
+# ---------------------------------------------------------------------------
+instructions:
+  nop:        {channel: 0, operands: [], status: spec}
+
+  # --- Immediate / wait group ---
+  # sec 11.1 shows `movi_u16 0x3c00, r1` / `movi_i32 128, r2` / `movi_f16 0.5, r3`
+  # but sec 3's regbank example shows a *different*, lower-level immediate
+  # path: `ploadu_l 0xCAFE` then `loadu_h 0xCAFE, r33`, implying a staging
+  # register plus a two-instruction load-upper/load-lower sequence for values
+  # that don't fit the encoding. Relationship between movi_* and ploadu_l/
+  # loadu_h is UNSPECIFIED. See OPEN_QUESTIONS.md item 2.
+  movi_u16:   {channel: 1, operands: [imm16, dst],   status: guess, note: "assumed pseudo-op expanding to ploadu_l/loadu_h pair"}
+  movi_i32:   {channel: 1, operands: [imm32, dst],   status: guess, note: "assumed pseudo-op; 32-bit imm cannot fit in one 32-bit word alongside opcode+dst"}
+  movi_f16:   {channel: 1, operands: [immf16, dst],  status: guess, note: "assumed pseudo-op lowering to movi_u16 of the bit pattern"}
+  ploadu_l:   {channel: 1, operands: [imm16],        status: guess, note: "loads low 16 bits of immediate into a hidden staging latch"}
+  loadu_h:    {channel: 1, operands: [imm16, dst],   status: guess, note: "combines staging latch with this imm16 into dst; exact bit split unknown"}
+  # Guessed as further subops of channel 0 (nop family), since a wait is
+  # naturally nop-like (no register effect, just stalls issue) and there is
+  # no spare opcode channel to give the wait family its own slot. See
+  # docs/isa/OPEN_QUESTIONS.md item 11 for the real hazard-signaling model.
+  wait:            {channel: 0, operands: [], status: guess, note: "generic wait; stalls until all outstanding functional units are idle"}
+  wait_short:      {channel: 0, operands: [], status: guess}
+  wait_load:       {channel: 0, operands: [], status: guess}
+  wait_fcomp:      {channel: 0, operands: [], status: guess}
+  wait_fadd:       {channel: 0, operands: [], status: guess}
+  wait_fmul:       {channel: 0, operands: [], status: guess}
+  wait_fdiv:       {channel: 0, operands: [], status: guess}
+  wait_conv:       {channel: 0, operands: [], status: guess}
+  regbank:
+    channel: 0
+    operands: [bit, bit, bit]
+    status: guess
+    note: >
+      Guessed as a variant of channel 0 (nop) distinguished by subop=1, since
+      all 32 opcodes are already claimed by Tables 5-6 and regbank has no
+      table entry of its own. The three operands (srcA_hi, srcB_hi, dst_hi)
+      are packed as the LSB of the srcA, srcB, and dst fields respectively
+      (bits 16, 5, 0). Sets one-shot state consumed by the immediately
+      following instruction's register-field decode (adds 32 to any of
+      srcA/srcB/dst that resolves to a register and had its hi flag set),
+      then clears. See OPEN_QUESTIONS.md item 3.
+
+  # --- Move and sign (channel 2) ---
+  copy:       {channel: 2, operands: [srcA, dst], status: spec}
+  fabs16:     {channel: 2, operands: [srcA, dst], status: spec}
+  fneg16:     {channel: 2, operands: [srcA, dst], status: spec}
+  fnabs16:    {channel: 2, operands: [srcA, dst], status: spec}
+
+  # --- FP16 arithmetic ---
+  fmulp2_16:  {channel: 3,  operands: [srcA, srcB, dst], status: spec, latency_class: fp16_multiply}
+  fadd16:     {channel: 4,  operands: [srcA, srcB, dst], status: spec, latency_class: fp16_addsub}
+  fsub16:     {channel: 4,  operands: [srcA, srcB, dst], status: spec, latency_class: fp16_addsub}
+  fmul16:     {channel: 5,  operands: [srcA, srcB, dst], status: spec, latency_class: fp16_multiply}
+  fdiv16:     {channel: 6,  operands: [srcA, srcB, dst], status: spec, latency_class: fp16_divide}
+  fmin16:     {channel: 7,  operands: [srcA, srcB, dst], status: spec, latency_class: short}
+  fmax16:     {channel: 7,  operands: [srcA, srcB, dst], status: spec, latency_class: short}
+
+  # --- Rounding ---
+  trunc16:    {channel: 8, operands: [srcA, dst], status: spec, latency_class: short}
+  round16:    {channel: 8, operands: [srcA, dst], status: spec, latency_class: short}
+  ceil16:     {channel: 8, operands: [srcA, dst], status: spec, latency_class: short}
+  floor16:    {channel: 8, operands: [srcA, dst], status: spec, latency_class: short}
+
+  # --- Conversions ---
+  f16tou8_ll: {channel: 9,  operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16tou8_lh: {channel: 9,  operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16tou8_hl: {channel: 9,  operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16tou8_hh: {channel: 9,  operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16tou16_l: {channel: 10, operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16tou16_h: {channel: 10, operands: [srcA, dst], status: guess, latency_class: conversion}
+  f16toi32:   {channel: 11, operands: [srcA, dst], status: spec,  latency_class: conversion}
+  u8tof16_ll: {channel: 12, operands: [srcA, dst], status: guess, latency_class: conversion}
+  u8tof16_lh: {channel: 12, operands: [srcA, dst], status: guess, latency_class: conversion}
+  u8tof16_hl: {channel: 12, operands: [srcA, dst], status: guess, latency_class: conversion}
+  u8tof16_hh: {channel: 12, operands: [srcA, dst], status: guess, latency_class: conversion}
+  u16tof16_l: {channel: 13, operands: [srcA, dst], status: guess, latency_class: conversion}
+  u16tof16_h: {channel: 13, operands: [srcA, dst], status: guess, latency_class: conversion}
+  i32tof16:   {channel: 14, operands: [srcA, dst], status: spec,  latency_class: conversion}
+  u32tof16:   {channel: 14, operands: [srcA, dst], status: spec,  latency_class: conversion}
+
+  # --- FP compare-to-CR (channel 15) ---
+  # Table 7 lists 8 mnemonics against a single documented channel. Assumed
+  # each is a distinct sub-op writing ONE condition register (dst field
+  # repurposed as CR index), by analogy with icmp_* (Table 8). Whether one
+  # instruction can instead update multiple/all CRs is unconfirmed --
+  # OPEN_QUESTIONS.md item 7.
+  fcomp_l:    {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_le:   {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_e:    {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_ge:   {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_g:    {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_ne:   {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_o:    {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+  fcomp_u:    {channel: 15, operands: [srcA, srcB, cr_dst], status: guess, latency_class: fp_compare}
+
+  # --- Integer (channel 16) ---
+  add:        {channel: 16, operands: [srcA, srcB, dst], status: spec, latency_class: short}
+  and:        {channel: 16, operands: [srcA, srcB, dst], status: spec, latency_class: short}
+  istep4:     {channel: 16, operands: [srcA, dst],        status: guess, latency_class: short, note: "dst += 4, or srcA*4 -> dst; exact op unspecified"}
+  vset4:      {channel: 16, operands: [srcA, srcB, vdst],  status: spec, latency_class: short, note: "sec 11.4: vset4 rEdgeBase, rDeltaX, v0 -- evaluates edge fn at 4 lanes"}
+
+  # --- Memory / control-flow (Table 9) ---
+  load_addr:  {channel: 17, operands: [srcA], status: spec}
+  store_addr: {channel: 18, operands: [srcA], status: spec}
+  load:       {channel: 19, operands: [addr_reg, dst], status: spec, latency_class: load}
+  i_load:     {channel: 19, operands: [dst],           status: guess, latency_class: load, note: "indirect via active load address latch"}
+  pop:        {channel: 19, operands: [dst],           status: guess, latency_class: load}
+  store:      {channel: 20, operands: [srcA, addr_reg], status: spec, latency_class: short}
+  i_store:    {channel: 20, operands: [srcA],           status: guess, latency_class: short}
+  push:       {channel: 20, operands: [srcA],           status: guess, latency_class: short}
+  # jump/rcall grouped in one channel and goto/call in another (Table 6)
+  # is read as indirect (register-target) vs. direct (immediate-target)
+  # pairs, by mnemonic-name analogy with common ISA conventions -- NOT
+  # stated in the spec. See OPEN_QUESTIONS.md item 4.
+  jump:       {channel: 21, operands: [srcA],  status: guess, control_flow: true, note: "indirect jump: PC <- reg"}
+  rcall:      {channel: 21, operands: [srcA],  status: guess, control_flow: true, note: "indirect call: push return addr, PC <- reg"}
+  goto:       {channel: 22, operands: [target], status: guess, control_flow: true, note: "direct jump: PC <- PC + signed 22-bit word offset"}
+  call:       {channel: 22, operands: [target], status: guess, control_flow: true, note: "direct call: push return addr, PC <- PC + signed 22-bit word offset"}
+  ret:        {channel: 23, operands: [],       status: spec,  control_flow: true, note: "pop return addr into PC"}
+  stop_core:  {channel: 24, operands: [],       status: spec}
+
+  # --- Signed integer compare-to-CR (Table 8, sec. 8) ---
+  icmp_lt:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+  icmp_le:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+  icmp_eq:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+  icmp_ge:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+  icmp_gt:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+  icmp_ne:    {channel: 26, operands: [srcA, srcB, cr_dst], status: spec, latency_class: short}
+
+  # --- Vector helpers (sec 11.4, Table 7) ---
+  v4cr_store:               {channel: 25, operands: [vsrc, addr_reg], status: guess}
+  v4cr_store_step:          {channel: 25, operands: [vsrc, addr_reg], status: guess}
+  vstore_mask:              {channel: 25, operands: [vsrc, addr_reg], status: spec, note: "sec 11.4: vstore_mask vColor, rFbAddr"}
+  v4cmp_ge_zero:            {channel: 27, operands: [vsrc], status: spec}
+  v4cmp_ge_zero_and:        {channel: 28, operands: [vsrc], status: guess}
+  v4mask_to_cr:             {channel: 29, operands: [cr_dst], status: guess}
+  vcmp_ge_zero_i32:         {channel: 29, operands: [vsrc], status: spec, note: "sec 11.4: vcmp_ge_zero_i32 v0"}
+  v4cmp_ge_zero_step:       {channel: 30, operands: [vsrc], status: guess}
+  v4cmp_ge_zero_step_and_p1: {channel: 31, operands: [vsrc], status: guess}
+  vbcast:     {channel: 16, operands: [srcA, vdst], status: guess, note: "broadcast scalar to all 4 lanes; folded into channel 16, see ENCODING_GUESSES.md"}
+  vadd_i32:   {channel: 16, operands: [vsrc, vdst], status: guess, note: "operand shape unconfirmed -- likely needs two vector sources, but only one source-field slot is available per instruction word; see OPEN_QUESTIONS.md item 5"}
+
+# ---------------------------------------------------------------------------
+# Latency contract (Table 10). Authoritative durations; the "safe cycles"
+# framing for load/short suggests these may be conservative bounds rather
+# than exact fixed latencies -- see OPEN_QUESTIONS.md item 11.
+# ---------------------------------------------------------------------------
+latency_classes:
+  fp16_addsub:  {cycles: 6, wait_mnemonic: wait_fadd}
+  fp16_multiply: {cycles: 8, wait_mnemonic: wait_fmul}
+  fp16_divide:  {cycles: 8, wait_mnemonic: wait_fdiv}
+  fp_compare:   {cycles: 3, wait_mnemonic: wait_fcomp}
+  conversion:   {cycles: 3, wait_mnemonic: wait_conv}
+  load:         {cycles: 4, wait_mnemonic: wait_load, note: "'4 safe cycles' -- may be a minimum, not exact"}
+  short:        {cycles: 3, wait_mnemonic: wait_short, note: "'3 safe cycles' -- conservative bound per spec wording"}
+
+# ---------------------------------------------------------------------------
+# Vector register file. NOT documented at all in the register model (sec 3,
+# which only describes r0-r63 scalar). Examples use v0, vColor, vEdgeBase.
+# See OPEN_QUESTIONS.md item 5.
+# ---------------------------------------------------------------------------
+vector_registers:
+  status: guess
+  assumed_count: 8
+  assumed_lanes: 4
+  assumed_lane_width_bits: 32
+  note: "Assumed a separate small vector file, 4 lanes matching v4* mnemonics. Could equally be 4 aliased scalar registers."

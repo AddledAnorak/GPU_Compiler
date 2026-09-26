@@ -1,0 +1,1798 @@
+From ee76a9e5ac03c17809738749501f025c00cc18c8 Mon Sep 17 00:00:00 2001
+From: AddledAnorak <ee3230967@iitd.ac.in>
+Date: Mon, 24 Aug 2026 00:10:57 +0530
+Subject: [PATCH] mgc: add a minimal software-winsys Gallium driver skeleton +
+ NIR backend
+
+New driver at src/gallium/drivers/mgc/, selected via GALLIUM_DRIVER=mgc,
+targeting the MGC-FP16-v1 micro-GPU (see /docs/isa/isa.yaml in the parent
+project). Modeled on softpipe but reduced to the minimum needed to reach
+shader compilation over a surfaceless EGL device -- no rasterization, no
+real resource storage, no draw module (see mgc_screen.h's scope note and
+/docs/driver/gallium-integration.md).
+
+mgc_compiler.c is the NIR -> MGC assembly text backend: the "Direct"
+arithmetic subset from the parent project's nir_opcode_triage.md
+(fadd/fsub/fmul/fdiv/fneg/fabs/fmin/fmax/mov), scalar constants inlined
+against the 8-entry constant bank where they match, one register per SSA
+def with no reuse (a documented non-decision, not an oversight -- real
+allocation is later scope), and a conservative wait_* after every
+producer with a latency class. Emits text, not binary, so the existing
+Python mgcasm/mgcsim toolchain in the parent project is the verification
+path with no new tooling needed.
+
+Five wiring edits follow the softpipe registration pattern exactly:
+meson.options (add 'mgc' to gallium-drivers choices), meson.build
+(with_gallium_mgc, folded into with_gallium_swrast), src/gallium/
+meson.build (subdir + driver_swrast dependency), and sw_helper.h (the
+GALLIUM_MGC screen-creation dispatch, deliberately not matched by the
+empty-driver-name fallback or added to the softpipe/llvmpipe fallback
+list, so GALLIUM_DRIVER=mgc fails cleanly instead of silently falling
+back to another driver on error).
+
+mgc_test_arith.c is a standalone NIR-builder-based unit test for
+mgc_compile_nir(), bypassing GLSL entirely -- GLSL constant-folds
+pure-literal arithmetic before it reaches any driver, so this is the only
+way to exercise a real multi-instruction fmul16/fadd16/fdiv16 chain with
+wait_* insertion in isolation.
+
+Verified end to end: GALLIUM_DRIVER=mgc creates a GLES2 context over
+surfaceless EGL, GL_RENDERER reports "mgc", real GLSL shaders compile to
+MGC assembly via create_fs_state, and the emitted text assembles,
+round-trips, and executes bit-exact in the parent project's mgcsim with
+no LatencyViolation (see its tests/test_backend_e2e.py). softpipe is
+unaffected and still renders correctly as the reference oracle.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+---
+ meson.build                                   |   3 +-
+ meson.options                                 |   2 +-
+ .../auxiliary/target-helpers/sw_helper.h      |  13 +
+ src/gallium/drivers/mgc/meson.build           |  36 ++
+ src/gallium/drivers/mgc/mgc_compiler.c        | 391 ++++++++++++++++++
+ src/gallium/drivers/mgc/mgc_compiler.h        |  34 ++
+ src/gallium/drivers/mgc/mgc_context.c         | 136 ++++++
+ src/gallium/drivers/mgc/mgc_context.h         |  31 ++
+ src/gallium/drivers/mgc/mgc_public.h          |  19 +
+ src/gallium/drivers/mgc/mgc_resource.c        | 174 ++++++++
+ src/gallium/drivers/mgc/mgc_resource.h        |  28 ++
+ src/gallium/drivers/mgc/mgc_screen.c          | 318 ++++++++++++++
+ src/gallium/drivers/mgc/mgc_screen.h          |  28 ++
+ src/gallium/drivers/mgc/mgc_state.c           | 296 +++++++++++++
+ src/gallium/drivers/mgc/mgc_test_arith.c      |  62 +++
+ src/gallium/meson.build                       |  15 +-
+ 16 files changed, 1575 insertions(+), 11 deletions(-)
+ create mode 100644 src/gallium/drivers/mgc/meson.build
+ create mode 100644 src/gallium/drivers/mgc/mgc_compiler.c
+ create mode 100644 src/gallium/drivers/mgc/mgc_compiler.h
+ create mode 100644 src/gallium/drivers/mgc/mgc_context.c
+ create mode 100644 src/gallium/drivers/mgc/mgc_context.h
+ create mode 100644 src/gallium/drivers/mgc/mgc_public.h
+ create mode 100644 src/gallium/drivers/mgc/mgc_resource.c
+ create mode 100644 src/gallium/drivers/mgc/mgc_resource.h
+ create mode 100644 src/gallium/drivers/mgc/mgc_screen.c
+ create mode 100644 src/gallium/drivers/mgc/mgc_screen.h
+ create mode 100644 src/gallium/drivers/mgc/mgc_state.c
+ create mode 100644 src/gallium/drivers/mgc/mgc_test_arith.c
+
+diff --git a/meson.build b/meson.build
+index 427cfde..c96c929 100644
+--- a/meson.build
++++ b/meson.build
+@@ -193,6 +193,7 @@ with_gallium_nouveau = gallium_drivers.contains('nouveau')
+ with_gallium_freedreno = gallium_drivers.contains('freedreno')
+ with_gallium_softpipe = gallium_drivers.contains('softpipe')
+ with_gallium_llvmpipe = gallium_drivers.contains('llvmpipe')
++with_gallium_mgc = gallium_drivers.contains('mgc')
+ with_gallium_vc4 = gallium_drivers.contains('vc4')
+ with_gallium_v3d = gallium_drivers.contains('v3d')
+ with_gallium_panfrost = gallium_drivers.contains('panfrost')
+@@ -216,7 +217,7 @@ with_llvm = with_llvm \
+   .enable_if(with_gallium_llvmpipe, error_message : 'LLVMPipe Gallium driver requires LLVM')
+ 
+ # compatibility for "swrast" as an internal-ish driver name
+-with_gallium_swrast = with_gallium_softpipe or with_gallium_llvmpipe
++with_gallium_swrast = with_gallium_softpipe or with_gallium_llvmpipe or with_gallium_mgc
+ if with_gallium_swrast
+   pre_args += '-DHAVE_SWRAST'
+ endif
+diff --git a/meson.options b/meson.options
+index c3c02c4..9e564fd 100644
+--- a/meson.options
++++ b/meson.options
+@@ -81,7 +81,7 @@ option(
+   choices : [
+     'all', 'auto',
+     'asahi', 'crocus', 'd3d12', 'etnaviv', 'freedreno', 'i915', 'iris',
+-    'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
++    'lima', 'llvmpipe', 'mgc', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
+     'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
+   ],
+   description : 'List of gallium drivers to build. If this is set to auto ' +
+diff --git a/src/gallium/auxiliary/target-helpers/sw_helper.h b/src/gallium/auxiliary/target-helpers/sw_helper.h
+index 030f615..f1bcd1d 100644
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -24,6 +24,10 @@
+ #include "softpipe/sp_public.h"
+ #endif
+ 
++#ifdef GALLIUM_MGC
++#include "mgc/mgc_public.h"
++#endif
++
+ #ifdef GALLIUM_LLVMPIPE
+ #include "llvmpipe/lp_public.h"
+ #endif
+@@ -56,6 +60,15 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
+       screen = softpipe_create_screen(winsys);
+ #endif
+ 
++#if defined(GALLIUM_MGC)
++   /* Deliberately NOT matched by !driver[0] (unlike llvmpipe above) and
++    * NOT added to the drivers[] fallback list in sw_screen_create_vk()
++    * below -- GALLIUM_DRIVER=mgc must fail cleanly rather than silently
++    * fall back to another driver if screen creation fails. */
++   if (screen == NULL && strcmp(driver, "mgc") == 0)
++      screen = mgc_create_screen(winsys);
++#endif
++
+ #if defined(GALLIUM_ZINK)
+    if (screen == NULL && strcmp(driver, "zink") == 0)
+       screen = zink_create_screen(winsys, config);
+diff --git a/src/gallium/drivers/mgc/meson.build b/src/gallium/drivers/mgc/meson.build
+new file mode 100644
+index 0000000..6bbf553
+--- /dev/null
++++ b/src/gallium/drivers/mgc/meson.build
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: MIT
++
++files_mgc = files(
++  'mgc_compiler.c',
++  'mgc_context.c',
++  'mgc_resource.c',
++  'mgc_screen.c',
++  'mgc_state.c',
++)
++
++libmgc = static_library(
++  'mgc',
++  files_mgc,
++  include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
++  c_args : [c_msvc_compat_args],
++  gnu_symbol_visibility : 'hidden',
++  dependencies : [idep_nir, idep_mesautil],
++)
++
++driver_mgc = declare_dependency(
++  compile_args : '-DGALLIUM_MGC',
++  link_with : libmgc,
++)
++
++# Standalone NIR-builder-based unit test for mgc_compile_nir() -- see
++# mgc_test_arith.c for why this bypasses GLSL. Not wired into `meson
++# test`; run the binary directly and feed its stdout to tools/mgcasm, per
++# the Weeks 1-4 plan's Phase 4 verification.
++mgc_test_arith = executable(
++  'mgc_test_arith',
++  files('mgc_test_arith.c'),
++  include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
++  link_with : [libmgc, libgallium],
++  dependencies : [idep_nir, idep_mesautil],
++  build_by_default : false,
++)
+diff --git a/src/gallium/drivers/mgc/mgc_compiler.c b/src/gallium/drivers/mgc/mgc_compiler.c
+new file mode 100644
+index 0000000..04b12ae
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_compiler.c
+@@ -0,0 +1,391 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_compiler.c -- NIR -> MGC-FP16-v1 assembly text. See mgc_compiler.h.
++ *
++ * Scope (Weeks 1-4 plan, Phase 4): the "Direct" arithmetic subset from
++ * docs/isa/nir_opcode_triage.md -- fadd/fsub/fmul/fdiv/fneg/fabs/fmin/fmax/
++ * mov, scalar constants (inlined against the 8-entry constant bank where
++ * they match, docs/isa/isa.yaml lines ~64-77, else a movi_f16 pseudo-op),
++ * and a store_output epilogue writing FP16 pixel channels to the
++ * placeholder framebuffer region (tools/mgcsim/memory.py FRAMEBUFFER_BASE
++ * -- keep these two in sync; see that file's own placeholder-address
++ * disclaimer). Anything else records an error rather than emitting wrong
++ * code.
++ *
++ * Register allocation is deliberately the simplest thing that works: one
++ * MGC scalar register per NIR SSA def, allocated upward from r0, never
++ * freed or reused, hard error past r31 (so the prototype never has to
++ * emit the regbank hi-register prefix). A real allocator is a Week 7-8
++ * concern -- see the plan. Because nir_lower_alu_to_scalar/
++ * nir_lower_load_const_to_scalar already ran (mgc_screen.c's
++ * lower_to_scalar option), and every one of the 8 captured shader traces
++ * fully flattens to a single basic block (see docs/glsl-to-nir/
++ * dictionary.md's 04_conditional/05_loop findings), a straight-line
++ * single-pass walk in source order is sufficient: every SSA def is
++ * produced before it's read.
++ *
++ * wait_* policy: emit the matching wait immediately after every producer
++ * that has a latency class (docs/isa/isa.yaml's latency_classes table).
++ * Trivially correct and a strict superset of what's needed -- mgcsim's
++ * hazard detector (tools/mgcsim/cpu.py) independently validates this by
++ * raising LatencyViolation on anything under-scheduled. The real
++ * scheduler (union wait classes across an instruction's sources, one
++ * wait per distinct class) is Week 5+.
++ */
++
++#include <errno.h>
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "compiler/nir/nir.h"
++#include "compiler/shader_enums.h"
++#include "util/half_float.h"
++#include "util/ralloc.h"
++#include "util/u_debug.h"
++
++#include "mgc_compiler.h"
++
++/* tools/mgcsim/memory.py: FRAMEBUFFER_BASE = 0x100000. Single point of
++ * change if that placeholder ever moves -- see this file's header. */
++#define MGC_FRAMEBUFFER_BASE 0x100000
++
++#define MGC_MAX_REGISTER 31
++
++enum mgc_val_kind {
++   MGC_VAL_REG,
++   MGC_VAL_CONST,
++};
++
++struct mgc_val {
++   enum mgc_val_kind kind;
++   int index; /* register number, or constant-bank index */
++};
++
++struct mgc_ctx {
++   void *mem_ctx;
++   char *asm_text;
++   char *error;
++   int next_reg;
++   struct mgc_val *vals; /* indexed by nir_def::index, size ssa_alloc */
++};
++
++/* The 8 documented constant-bank entries (docs/isa/isa.yaml lines
++ * ~64-77 / FP16_ISA_V1.pdf Table 4), by FP16 bit pattern. */
++static const uint16_t mgc_const_bank[8] = {
++   0xFC00, /* 0: -inf */
++   0xBC00, /* 1: -1.0 */
++   0x0000, /* 2: 0.0  */
++   0x3C00, /* 3: 1.0  */
++   0x3800, /* 4: 0.5  */
++   0x4248, /* 5: pi approximation */
++   0x7C00, /* 6: +inf */
++   0x7E00, /* 7: quiet NaN */
++};
++
++static void
++mgc_error(struct mgc_ctx *ctx, const char *fmt, ...)
++{
++   if (ctx->error)
++      return; /* keep the first error */
++
++   va_list ap;
++   va_start(ap, fmt);
++   ctx->error = ralloc_vasprintf(ctx->mem_ctx, fmt, ap);
++   va_end(ap);
++}
++
++static int
++mgc_alloc_reg(struct mgc_ctx *ctx)
++{
++   if (ctx->next_reg > MGC_MAX_REGISTER) {
++      mgc_error(ctx, "mgc: out of registers (>32 SSA values); register "
++                     "allocation is a Week 7-8 deliverable, see the plan");
++      return 0;
++   }
++   return ctx->next_reg++;
++}
++
++static void
++mgc_val_str(struct mgc_val v, char buf[8])
++{
++   if (v.kind == MGC_VAL_CONST)
++      snprintf(buf, 8, "#%d", v.index);
++   else
++      snprintf(buf, 8, "r%d", v.index);
++}
++
++/* Formats a float the way tools/mgcasm's operand parser expects a literal
++ * immediate: a '.' or exponent must be present, or it parses as an
++ * integer operand instead (assembler.py::_parse_operand). */
++static char *
++mgc_float_literal(void *mem_ctx, float f)
++{
++   char *s = ralloc_asprintf(mem_ctx, "%.9g", f);
++   if (!strpbrk(s, ".eE"))
++      s = ralloc_asprintf(mem_ctx, "%s.0", s);
++   return s;
++}
++
++/* Materializes a float value into a fresh register via the movi_f16
++ * pseudo-op (docs/isa/isa.yaml: no latency_class -- it's a multi-
++ * instruction pseudo-op the assembler expands, not a single hardware op
++ * with a hazard to wait on). */
++static struct mgc_val
++mgc_materialize_f16(struct mgc_ctx *ctx, float f)
++{
++   int reg = mgc_alloc_reg(ctx);
++   char *lit = mgc_float_literal(ctx->mem_ctx, f);
++   ralloc_asprintf_append(&ctx->asm_text, "movi_f16 %s, r%d\n", lit, reg);
++   return (struct mgc_val){ .kind = MGC_VAL_REG, .index = reg };
++}
++
++static void
++mgc_emit_load_const(struct mgc_ctx *ctx, nir_load_const_instr *load)
++{
++   if (load->def.num_components != 1) {
++      mgc_error(ctx, "mgc: load_const with %d components reached the "
++                     "backend -- nir_lower_load_const_to_scalar should "
++                     "have prevented this", load->def.num_components);
++      return;
++   }
++
++   double d = nir_const_value_as_float(load->value[0], load->def.bit_size);
++   float f = (float)d;
++   uint16_t bits = _mesa_float_to_half(f);
++
++   for (int i = 0; i < 8; i++) {
++      if (mgc_const_bank[i] == bits) {
++         ctx->vals[load->def.index] = (struct mgc_val){ .kind = MGC_VAL_CONST, .index = i };
++         return;
++      }
++   }
++
++   ctx->vals[load->def.index] = mgc_materialize_f16(ctx, f);
++}
++
++struct mgc_alu_op_info {
++   nir_op op;
++   const char *mnem;   /* NULL if unsupported */
++   const char *wait;   /* NULL if the op has no latency class */
++   bool commutative;
++};
++
++/* The "Direct" table from docs/isa/nir_opcode_triage.md, restricted to
++ * the arithmetic subset this phase targets. Wait mnemonics transcribed
++ * from docs/isa/isa.yaml's latency_classes (lines ~285-292). */
++static const struct mgc_alu_op_info mgc_alu_ops[] = {
++   { nir_op_fadd, "fadd16", "wait_fadd", true },
++   { nir_op_fsub, "fsub16", "wait_fadd", false },
++   { nir_op_fmul, "fmul16", "wait_fmul", true },
++   { nir_op_fdiv, "fdiv16", "wait_fdiv", false },
++   { nir_op_fmin, "fmin16", "wait_short", true },
++   { nir_op_fmax, "fmax16", "wait_short", true },
++   { nir_op_fneg, "fneg16", NULL, false },
++   { nir_op_fabs, "fabs16", NULL, false },
++   { nir_op_mov,  "copy",   NULL, false },
++};
++
++static const struct mgc_alu_op_info *
++mgc_find_alu_op(nir_op op)
++{
++   for (unsigned i = 0; i < ARRAY_SIZE(mgc_alu_ops); i++)
++      if (mgc_alu_ops[i].op == op)
++         return &mgc_alu_ops[i];
++   return NULL;
++}
++
++static void
++mgc_emit_alu(struct mgc_ctx *ctx, nir_alu_instr *alu)
++{
++   const struct mgc_alu_op_info *info = mgc_find_alu_op(alu->op);
++   unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
++
++   if (!info) {
++      mgc_error(ctx, "mgc: unsupported NIR ALU op '%s' -- see "
++                     "docs/isa/nir_opcode_triage.md for which bucket it "
++                     "falls in and what Week it's scoped for",
++                nir_op_infos[alu->op].name);
++      return;
++   }
++   if (alu->def.num_components != 1) {
++      mgc_error(ctx, "mgc: '%s' with %d components reached the backend -- "
++                     "nir_lower_alu_to_scalar should have prevented this",
++                info->mnem, alu->def.num_components);
++      return;
++   }
++
++   int dst = mgc_alloc_reg(ctx);
++
++   if (num_inputs == 1) {
++      /* copy/fabs16/fneg16 all accept a const-bank srcA directly
++       * (isa.yaml: operands: [srcA, dst]), so no swap/materialize logic
++       * is needed here the way the two-operand case below needs it. */
++      struct mgc_val a = ctx->vals[alu->src[0].src.ssa->index];
++      char abuf[8];
++      mgc_val_str(a, abuf);
++      ralloc_asprintf_append(&ctx->asm_text, "%s %s, r%d\n", info->mnem, abuf, dst);
++   } else {
++      struct mgc_val a = ctx->vals[alu->src[0].src.ssa->index];
++      struct mgc_val b = ctx->vals[alu->src[1].src.ssa->index];
++
++      /* Only srcA can be a constant-bank operand (isa.yaml bit 21,
++       * srcA_select). For a commutative op, swap operands so any
++       * constant lands in srcA. For a non-commutative op with the
++       * constant in srcB, materialize it into a register instead. */
++      if (b.kind == MGC_VAL_CONST) {
++         if (info->commutative) {
++            struct mgc_val t = a;
++            a = b;
++            b = t;
++         } else {
++            char lit[8];
++            mgc_val_str(b, lit);
++            /* lit here is "#N"; re-derive the float from the bank table
++             * to materialize it as a real register value. */
++            float f = _mesa_half_to_float(mgc_const_bank[b.index]);
++            b = mgc_materialize_f16(ctx, f);
++         }
++      }
++
++      char abuf[8], bbuf[8];
++      mgc_val_str(a, abuf);
++      mgc_val_str(b, bbuf);
++      ralloc_asprintf_append(&ctx->asm_text, "%s %s, %s, r%d\n",
++                              info->mnem, abuf, bbuf, dst);
++   }
++
++   if (info->wait)
++      ralloc_asprintf_append(&ctx->asm_text, "%s\n", info->wait);
++
++   ctx->vals[alu->def.index] = (struct mgc_val){ .kind = MGC_VAL_REG, .index = dst };
++}
++
++static void
++mgc_emit_store_output(struct mgc_ctx *ctx, nir_intrinsic_instr *intr)
++{
++   if (intr->num_components != 1) {
++      mgc_error(ctx, "mgc: store_output with %d components reached the "
++                     "backend -- nir_lower_io_to_scalar should have "
++                     "prevented this", intr->num_components);
++      return;
++   }
++
++   unsigned component = nir_intrinsic_component(intr);
++   struct mgc_val val = ctx->vals[intr->src[0].ssa->index];
++   char valbuf[8];
++   mgc_val_str(val, valbuf);
++
++   /* One fresh address register per output channel via movi_i32 -- see
++    * this file's header for why FRAMEBUFFER_BASE is hardcoded here.
++    * Simpler and just as correct as sharing one base register plus an
++    * add, and the ISA's 'add' has no immediate form to step by 1
++    * anyway. */
++   int addr_reg = mgc_alloc_reg(ctx);
++   ralloc_asprintf_append(&ctx->asm_text, "movi_i32 %u, r%d\n",
++                           MGC_FRAMEBUFFER_BASE + component, addr_reg);
++   ralloc_asprintf_append(&ctx->asm_text, "store %s, r%d\n", valbuf, addr_reg);
++}
++
++struct mgc_shader *
++mgc_compile_nir(struct nir_shader *nir)
++{
++   struct mgc_shader *shader = rzalloc(NULL, struct mgc_shader);
++   struct mgc_ctx ctx = {
++      .mem_ctx = shader,
++      .asm_text = ralloc_strdup(shader, ""),
++   };
++
++   ralloc_asprintf_append(&ctx.asm_text, "; mgc backend, MGC-FP16-v1, stage=%s\n",
++                           gl_shader_stage_name(nir->info.stage));
++
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   ctx.vals = rzalloc_array(shader, struct mgc_val, MAX2(impl->ssa_alloc, 1));
++
++   nir_foreach_block (block, impl) {
++      nir_foreach_instr (instr, block) {
++         switch (instr->type) {
++         case nir_instr_type_load_const:
++            mgc_emit_load_const(&ctx, nir_instr_as_load_const(instr));
++            break;
++         case nir_instr_type_alu:
++            mgc_emit_alu(&ctx, nir_instr_as_alu(instr));
++            break;
++         case nir_instr_type_intrinsic: {
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic == nir_intrinsic_store_output &&
++                nir->info.stage == MESA_SHADER_FRAGMENT) {
++               mgc_emit_store_output(&ctx, intr);
++            } else if (intr->intrinsic == nir_intrinsic_store_output) {
++               /* Vertex (or other non-fragment stage) output storage has
++                * no defined destination in this ISA at all -- no memory
++                * map entry, no convention, nothing (OPEN_QUESTIONS.md
++                * item 8). Rather than reject outright and make every
++                * vertex shader unlinkable (gl_Position always needs a
++                * store_output), discard it: a genuine no-op is more
++                * honest than guessing a destination address with no
++                * documentation basis, and it's not the point of interest
++                * for the Weeks 1-4 checkpoint, which is the fragment
++                * arithmetic path. Revisit once Week 5+ defines where
++                * vertex output actually goes. */
++            } else {
++               mgc_error(&ctx, "mgc: unsupported NIR intrinsic '%s' -- "
++                                "out of scope for Weeks 1-4, see the plan",
++                         nir_intrinsic_infos[intr->intrinsic].name);
++            }
++            break;
++         }
++         default:
++            mgc_error(&ctx, "mgc: unsupported NIR instruction type %d",
++                      instr->type);
++            break;
++         }
++         if (ctx.error)
++            goto done;
++      }
++   }
++
++   ralloc_asprintf_append(&ctx.asm_text, "stop_core\n");
++
++done:
++   ralloc_free(nir);
++   shader->nir = NULL;
++
++   if (ctx.error) {
++      shader->error = ctx.error;
++      shader->asm_text = NULL;
++   } else {
++      shader->asm_text = ctx.asm_text;
++   }
++   return shader;
++}
++
++void
++mgc_shader_destroy(struct mgc_shader *shader)
++{
++   ralloc_free(shader);
++}
++
++void
++mgc_maybe_dump_asm(struct mgc_shader *shader, const char *stage_name)
++{
++   const char *dir = getenv("MGC_ASM_DUMP");
++
++   if (!dir || !shader->asm_text)
++      return;
++
++   if (strcmp(dir, "-") == 0) {
++      fprintf(stderr, "%s", shader->asm_text);
++      return;
++   }
++
++   char *path = ralloc_asprintf(NULL, "%s/%s.asm", dir, stage_name);
++   FILE *f = fopen(path, "w");
++   if (f) {
++      fputs(shader->asm_text, f);
++      fclose(f);
++   } else {
++      fprintf(stderr, "mgc: could not write %s: %s\n", path, strerror(errno));
++   }
++   ralloc_free(path);
++}
+diff --git a/src/gallium/drivers/mgc/mgc_compiler.h b/src/gallium/drivers/mgc/mgc_compiler.h
+new file mode 100644
+index 0000000..9799da9
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_compiler.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_compiler.h -- NIR -> MGC-FP16-v1 assembly text translation.
++ * Student B's Week 3-4 deliverable. Scope: the "Direct" arithmetic subset
++ * from docs/isa/nir_opcode_triage.md (fadd/fsub/fmul/fdiv/fneg/fabs/
++ * fmin/fmax/mov, plus scalar constants and a store_output epilogue) --
++ * see the Weeks 1-4 plan, Phase 4.
++ */
++#ifndef MGC_COMPILER_H
++#define MGC_COMPILER_H
++
++struct nir_shader;
++struct nir_shader_compiler_options;
++
++/* mgc_screen.c -- see mgc_test_arith.c for why this is exposed. */
++const struct nir_shader_compiler_options *mgc_test_get_compiler_options(void);
++
++struct mgc_shader {
++   struct nir_shader *nir; /* NULL once compiled -- freed in mgc_compile_nir */
++   char *asm_text;         /* ralloc'd against this struct; NULL on error */
++   char *error;            /* ralloc'd against this struct; NULL on success */
++};
++
++/* Consumes (ralloc_free()s) `nir`. Always returns a valid struct -- check
++ * ->error to see whether ->asm_text is usable. */
++struct mgc_shader *mgc_compile_nir(struct nir_shader *nir);
++
++void mgc_shader_destroy(struct mgc_shader *shader);
++
++/* Writes shader->asm_text to $MGC_ASM_DUMP/<stage>_<name>.asm (or stderr
++ * if MGC_ASM_DUMP=-) when that env var is set. No-op otherwise. */
++void mgc_maybe_dump_asm(struct mgc_shader *shader, const char *stage_name);
++
++#endif
+diff --git a/src/gallium/drivers/mgc/mgc_context.c b/src/gallium/drivers/mgc/mgc_context.c
+new file mode 100644
+index 0000000..1f210a7
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_context.c
+@@ -0,0 +1,136 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_context.c -- pipe_context creation and the create_fs_state/
++ * create_vs_state hooks where NIR actually reaches the backend. See
++ * docs/driver/gallium-integration.md and the Weeks 1-4 plan, Phase 3/4.
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "compiler/nir/nir.h"
++#include "compiler/glsl_types.h"
++#include "util/u_debug_cb.h"
++#include "util/u_memory.h"
++#include "util/u_upload_mgr.h"
++#include "pipe/p_context.h"
++
++#include "mgc_context.h"
++#include "mgc_compiler.h"
++#include "mgc_resource.h"
++#include "mgc_screen.h"
++
++static int
++mgc_type_size(const struct glsl_type *type, bool bindless)
++{
++   return glsl_count_attribute_slots(type, false);
++}
++
++/* Re-lowers I/O from the deref/variable form st_nir_unlower_io_to_vars
++ * left it in (mgc_screen.c's compiler options leave io_options = 0,
++ * which is what triggers that unlowering) back into the load_input/
++ * store_output intrinsic form mgc_compiler.c walks -- the same path
++ * lima/vc4/etnaviv take. Then scalarizes so mgc_compiler.c never has to
++ * deal with a multi-component value. */
++static struct nir_shader *
++mgc_lower_shader(struct nir_shader *nir)
++{
++   NIR_PASS(_, nir, nir_lower_io,
++            nir_var_shader_in | nir_var_shader_out, mgc_type_size, 0);
++   NIR_PASS(_, nir, nir_lower_io_to_scalar,
++            nir_var_shader_in | nir_var_shader_out, NULL, NULL);
++   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
++   NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
++   NIR_PASS(_, nir, nir_copy_prop);
++   NIR_PASS(_, nir, nir_opt_dce);
++   return nir;
++}
++
++static void *
++mgc_create_shader_state(struct pipe_context *pipe,
++                         const struct pipe_shader_state *cso)
++{
++   assert(cso->type == PIPE_SHADER_IR_NIR);
++
++   struct nir_shader *nir = mgc_lower_shader(cso->ir.nir);
++   const char *stage_name =
++      nir->info.stage == MESA_SHADER_FRAGMENT ? "fs" : "vs";
++
++   /* mgc_compile_nir takes ownership of (frees) nir. */
++   struct mgc_shader *shader = mgc_compile_nir(nir);
++
++   if (shader->error) {
++      fprintf(stderr, "mgc: %s\n", shader->error);
++      /* Propagate the failure through the documented pipe_shader_state
++       * contract (p_state.h: "the driver can fail compilation ... store
++       * [the message] in the pointer below") so glLinkProgram actually
++       * fails instead of silently proceeding to a later draw call with
++       * no usable shader -- see i915_state.c/r300_state.c for the same
++       * cast-away-const pattern. Without this, an out-of-scope shader
++       * (e.g. one needing load_input, which Weeks 1-4 doesn't implement)
++       * would report link success and crash on the first draw instead of
++       * failing cleanly at compile time. */
++      struct pipe_shader_state *mut_cso = (struct pipe_shader_state *)cso;
++      if (mut_cso->report_compile_error)
++         mut_cso->error_message = strdup(shader->error);
++   } else {
++      mgc_maybe_dump_asm(shader, stage_name);
++   }
++
++   return shader;
++}
++
++static void
++mgc_bind_shader_state(struct pipe_context *pipe, void *state)
++{
++}
++
++static void
++mgc_delete_shader_state(struct pipe_context *pipe, void *state)
++{
++   mgc_shader_destroy((struct mgc_shader *)state);
++}
++
++static void
++mgc_destroy_context(struct pipe_context *pipe)
++{
++   struct mgc_context *ctx = mgc_context(pipe);
++
++   if (ctx->base.stream_uploader)
++      u_upload_destroy(ctx->base.stream_uploader);
++
++   FREE(ctx);
++}
++
++struct pipe_context *
++mgc_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
++{
++   struct mgc_context *ctx = CALLOC_STRUCT(mgc_context);
++
++   if (!ctx)
++      return NULL;
++
++   ctx->screen = mgc_screen(screen);
++   ctx->base.screen = screen;
++   ctx->base.priv = priv;
++   ctx->base.destroy = mgc_destroy_context;
++
++   ctx->base.create_fs_state = mgc_create_shader_state;
++   ctx->base.bind_fs_state = mgc_bind_shader_state;
++   ctx->base.delete_fs_state = mgc_delete_shader_state;
++   ctx->base.create_vs_state = mgc_create_shader_state;
++   ctx->base.bind_vs_state = mgc_bind_shader_state;
++   ctx->base.delete_vs_state = mgc_delete_shader_state;
++
++   mgc_init_state_funcs(&ctx->base);
++   mgc_init_context_resource_funcs(&ctx->base);
++
++   ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
++   if (!ctx->base.stream_uploader) {
++      FREE(ctx);
++      return NULL;
++   }
++   ctx->base.const_uploader = ctx->base.stream_uploader;
++
++   return &ctx->base;
++}
+diff --git a/src/gallium/drivers/mgc/mgc_context.h b/src/gallium/drivers/mgc/mgc_context.h
+new file mode 100644
+index 0000000..a85f8ce
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_context.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef MGC_CONTEXT_H
++#define MGC_CONTEXT_H
++
++#include "pipe/p_context.h"
++
++struct mgc_screen;
++
++struct mgc_context {
++   struct pipe_context base;
++   struct mgc_screen *screen;
++};
++
++static inline struct mgc_context *
++mgc_context(struct pipe_context *pipe)
++{
++   return (struct mgc_context *)pipe;
++}
++
++struct pipe_context *
++mgc_create_context(struct pipe_screen *screen, void *priv, unsigned flags);
++
++/* mgc_state.c -- trivial state object create/bind/delete + set_* setters.
++ * Wires the hooks cso_release_all() calls unconditionally
++ * (src/gallium/auxiliary/cso_cache/cso_context.c), plus the no-op
++ * rendering entry points (draw_vbo, clear, flush, ...) that must be
++ * non-NULL but are never exercised in the Weeks 1-4 surfaceless-EGL,
++ * no-draw scope. See docs/driver/gallium-integration.md. */
++void mgc_init_state_funcs(struct pipe_context *pipe);
++
++#endif
+diff --git a/src/gallium/drivers/mgc/mgc_public.h b/src/gallium/drivers/mgc/mgc_public.h
+new file mode 100644
+index 0000000..f4b436b
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_public.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef MGC_PUBLIC_H
++#define MGC_PUBLIC_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct pipe_screen;
++struct sw_winsys;
++
++struct pipe_screen *
++mgc_create_screen(struct sw_winsys *winsys);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/gallium/drivers/mgc/mgc_resource.c b/src/gallium/drivers/mgc/mgc_resource.c
+new file mode 100644
+index 0000000..ee45a0d
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_resource.c
+@@ -0,0 +1,174 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_resource.c -- malloc-backed pipe_resource. There is no GPU-visible
++ * memory to allocate from (no FPGA, no DRM device yet) -- see
++ * docs/driver/gallium-integration.md section 3. This exists only so the
++ * cso layer and transfer machinery have something non-NULL to operate on;
++ * nothing here is ever actually rendered into for the Weeks 1-4 scope
++ * (surfaceless EGL, no draw calls).
++ */
++
++#include "util/format/u_format.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++#include "util/u_transfer.h"
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++
++#include "mgc_resource.h"
++
++static uint64_t
++mgc_resource_size(const struct pipe_resource *templat)
++{
++   uint64_t size = (uint64_t)templat->width0 *
++                    MAX2(templat->height0, 1) *
++                    MAX2(templat->depth0, 1) *
++                    MAX2(templat->array_size, 1);
++   if (templat->target != PIPE_BUFFER)
++      size *= util_format_get_blocksize(templat->format);
++   return size;
++}
++
++static struct pipe_resource *
++mgc_resource_create(struct pipe_screen *screen,
++                     const struct pipe_resource *templat)
++{
++   struct mgc_resource *res = CALLOC_STRUCT(mgc_resource);
++
++   if (!res)
++      return NULL;
++
++   res->base = *templat;
++   res->base.screen = screen;
++   pipe_reference_init(&res->base.reference, 1);
++
++   uint64_t size = mgc_resource_size(templat);
++   res->data = align_malloc(size ? size : 1, 64);
++   if (!res->data) {
++      FREE(res);
++      return NULL;
++   }
++
++   return &res->base;
++}
++
++static void
++mgc_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pt)
++{
++   struct mgc_resource *res = mgc_resource(pt);
++
++   align_free(res->data);
++   FREE(res);
++}
++
++static bool
++mgc_can_create_resource(struct pipe_screen *screen,
++                         const struct pipe_resource *templat)
++{
++   return true;
++}
++
++static bool
++mgc_resource_get_handle(struct pipe_screen *screen,
++                         struct pipe_context *context,
++                         struct pipe_resource *resource,
++                         struct winsys_handle *handle,
++                         unsigned usage)
++{
++   /* No external sharing -- nothing to hand out a dmabuf/GEM handle for
++    * yet. */
++   return false;
++}
++
++void
++mgc_init_screen_resource_funcs(struct pipe_screen *screen)
++{
++   screen->resource_create = mgc_resource_create;
++   screen->resource_destroy = mgc_resource_destroy;
++   screen->can_create_resource = mgc_can_create_resource;
++   screen->resource_get_handle = mgc_resource_get_handle;
++}
++
++/* Used for both buffer_map and texture_map -- same signature, same
++ * backing store (a flat malloc'd allocation), so one implementation
++ * covers both. */
++static void *
++mgc_transfer_map(struct pipe_context *pipe,
++                  struct pipe_resource *resource,
++                  unsigned level,
++                  unsigned usage,
++                  const struct pipe_box *box,
++                  struct pipe_transfer **out_transfer)
++{
++   struct mgc_resource *res = mgc_resource(resource);
++   struct pipe_transfer *transfer = CALLOC_STRUCT(pipe_transfer);
++
++   if (!transfer)
++      return NULL;
++
++   transfer->resource = resource;
++   transfer->level = level;
++   transfer->usage = usage;
++   transfer->box = *box;
++
++   if (resource->target == PIPE_BUFFER) {
++      transfer->stride = 0;
++      transfer->layer_stride = 0;
++      *out_transfer = transfer;
++      return (uint8_t *)res->data + box->x;
++   }
++
++   unsigned blocksize = util_format_get_blocksize(resource->format);
++   transfer->stride = resource->width0 * blocksize;
++   transfer->layer_stride = (uintptr_t)transfer->stride * resource->height0;
++   *out_transfer = transfer;
++   return (uint8_t *)res->data +
++          box->z * transfer->layer_stride +
++          box->y * transfer->stride +
++          box->x * blocksize;
++}
++
++static void
++mgc_transfer_unmap(struct pipe_context *pipe, struct pipe_transfer *transfer)
++{
++   FREE(transfer);
++}
++
++static struct pipe_surface *
++mgc_create_surface(struct pipe_context *pipe,
++                    struct pipe_resource *resource,
++                    const struct pipe_surface *templat)
++{
++   struct pipe_surface *surf = CALLOC_STRUCT(pipe_surface);
++
++   if (!surf)
++      return NULL;
++
++   pipe_surface_init(pipe, surf, resource, templat->level, templat->first_layer);
++   surf->format = templat->format;
++   surf->nr_samples = templat->nr_samples;
++   surf->last_layer = templat->last_layer;
++   return surf;
++}
++
++static void
++mgc_surface_destroy(struct pipe_context *pipe, struct pipe_surface *surf)
++{
++   pipe_resource_reference(&surf->texture, NULL);
++   FREE(surf);
++}
++
++void
++mgc_init_context_resource_funcs(struct pipe_context *pipe)
++{
++   pipe->buffer_map = mgc_transfer_map;
++   pipe->texture_map = mgc_transfer_map;
++   pipe->buffer_unmap = mgc_transfer_unmap;
++   pipe->texture_unmap = mgc_transfer_unmap;
++   pipe->transfer_flush_region = u_default_transfer_flush_region;
++   pipe->buffer_subdata = u_default_buffer_subdata;
++   pipe->texture_subdata = u_default_texture_subdata;
++   pipe->create_surface = mgc_create_surface;
++   pipe->surface_destroy = mgc_surface_destroy;
++}
+diff --git a/src/gallium/drivers/mgc/mgc_resource.h b/src/gallium/drivers/mgc/mgc_resource.h
+new file mode 100644
+index 0000000..85fce44
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_resource.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef MGC_RESOURCE_H
++#define MGC_RESOURCE_H
++
++#include "pipe/p_state.h"
++
++struct pipe_screen;
++struct pipe_context;
++
++/* No real storage backend exists yet (no FPGA, no DRM device) -- this is a
++ * plain malloc'd buffer standing in for GPU-visible memory. See
++ * docs/driver/gallium-integration.md section 3 for what a real resource
++ * backend on Zynq would need instead. */
++struct mgc_resource {
++   struct pipe_resource base;
++   void *data;
++};
++
++static inline struct mgc_resource *
++mgc_resource(struct pipe_resource *pt)
++{
++   return (struct mgc_resource *)pt;
++}
++
++void mgc_init_screen_resource_funcs(struct pipe_screen *screen);
++void mgc_init_context_resource_funcs(struct pipe_context *pipe);
++
++#endif
+diff --git a/src/gallium/drivers/mgc/mgc_screen.c b/src/gallium/drivers/mgc/mgc_screen.c
+new file mode 100644
+index 0000000..61af62b
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_screen.c
+@@ -0,0 +1,318 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_screen.c -- pipe_screen implementation. See mgc_screen.h for the
++ * scope note. Caps are set to the minimum needed for a GLES2 context to
++ * come up over a surfaceless EGL device and reach glLinkProgram -- see
++ * docs/driver/gallium-integration.md and the Weeks 1-4 plan's Phase 3.
++ */
++
++#include "compiler/nir/nir.h"
++#include "util/format/u_format.h"
++#include "util/u_memory.h"
++#include "util/u_screen.h"
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++
++#include "mgc_screen.h"
++#include "mgc_context.h"
++#include "mgc_compiler.h"
++#include "mgc_resource.h"
++#include "mgc_public.h"
++
++static const char *
++mgc_get_vendor(struct pipe_screen *screen)
++{
++   return "BTP";
++}
++
++static const char *
++mgc_get_name(struct pipe_screen *screen)
++{
++   return "mgc";
++}
++
++/* MGC-FP16-v1 compiler options: encodes the ISA gaps documented in
++ * docs/isa/isa.yaml and docs/isa/OPEN_QUESTIONS.md, and the corrected
++ * (against real Mesa 25.2.0 field names) recommendations in
++ * docs/isa/nir_opcode_triage.md. Boolean representation is left at its
++ * default (native 1-bit) -- nothing to set for that, see the triage doc.
++ */
++static const nir_shader_compiler_options mgc_compiler_options = {
++   /* Scalar ISA: the GLSL linker runs nir_lower_alu_to_scalar,
++    * nir_lower_phis_to_scalar, and nir_lower_load_const_to_scalar for us
++    * when this is set (gl_nir_linker.c). */
++   .lower_to_scalar = true,
++   .lower_vector_cmp = true,
++   .lower_fdph = true,
++
++   /* No hardware unit for any of these -- see isa.yaml's opcode map: no
++    * fsqrt/frsq, no sin/cos, no shifter, no FMA. */
++   .lower_fsqrt = true,
++   .lower_sincos = true,
++   .lower_fpow = true,
++   .lower_fmod = true,
++   .lower_ldexp = true,
++   .lower_bitops = true,
++   .lower_bitfield_extract = true,
++   .lower_bitfield_insert = true,
++   .lower_bitfield_reverse = true,
++   .lower_bit_count = true,
++   .lower_ifind_msb = true,
++   .lower_ufind_msb = true,
++   .lower_find_lsb = true,
++   .lower_uadd_carry = true,
++   .lower_usub_borrow = true,
++   .lower_mul_high = true,
++   .lower_extract_byte = true,
++   .lower_extract_word = true,
++   .lower_insert_byte = true,
++   .lower_insert_word = true,
++   .lower_fquantize2f16 = true,
++
++   .lower_flrp16 = true,
++   .lower_flrp32 = true,
++   .lower_flrp64 = true,
++   .lower_fdiv = false, /* we HAVE fdiv16 */
++   .lower_ffma16 = true, /* no FMA op -- confirmed live in shaders/06_builtin_math's `* 0.5 + 0.5` */
++   .lower_ffma32 = true,
++   .lower_ffma64 = true,
++   .lower_fsat = true, /* 2-instruction fmax16/fmin16 sequence, see nir_opcode_triage.md */
++   .lower_scmp = true,
++   .lower_fisnormal = true,
++
++   .lower_int64_options = ~0,
++   .lower_doubles_options = ~0,
++
++   .support_16bit_alu = true,
++
++   .max_unroll_iterations = 32,
++   .lower_uniforms_to_ubo = true,
++};
++
++static const struct nir_shader_compiler_options *
++mgc_get_compiler_options(struct pipe_screen *pscreen,
++                          enum pipe_shader_type shader)
++{
++   return &mgc_compiler_options;
++}
++
++/* Exposes the options struct above to mgc_test_arith.c (a standalone NIR-
++ * builder-based unit test for mgc_compile_nir, bypassing GLSL entirely --
++ * see that file for why: GLSL constant-folds pure-literal arithmetic
++ * before it ever reaches a driver). Not part of the pipe_screen vtable. */
++const struct nir_shader_compiler_options *
++mgc_test_get_compiler_options(void)
++{
++   return &mgc_compiler_options;
++}
++
++static bool
++mgc_is_format_supported(struct pipe_screen *screen,
++                         enum pipe_format format,
++                         enum pipe_texture_target target,
++                         unsigned sample_count,
++                         unsigned storage_sample_count,
++                         unsigned bind)
++{
++   const struct util_format_description *desc;
++
++   if (sample_count > 1)
++      return false;
++   if (MAX2(1, sample_count) != MAX2(1, storage_sample_count))
++      return false;
++
++   desc = util_format_description(format);
++   if (!desc)
++      return false;
++
++   /* No decode hardware for compressed formats. */
++   if (desc->layout == UTIL_FORMAT_LAYOUT_ASTC ||
++       desc->layout == UTIL_FORMAT_LAYOUT_ATC ||
++       desc->layout == UTIL_FORMAT_LAYOUT_ETC)
++      return false;
++
++   if ((bind & PIPE_BIND_DEPTH_STENCIL) &&
++       desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS)
++      return false;
++
++   if ((bind & PIPE_BIND_RENDER_TARGET) &&
++       desc->colorspace == UTIL_FORMAT_COLORSPACE_ZS)
++      return false;
++
++   return true;
++}
++
++static void
++mgc_init_shader_caps(struct mgc_screen *screen)
++{
++   for (unsigned i = 0; i <= PIPE_SHADER_COMPUTE; i++) {
++      struct pipe_shader_caps *caps =
++         (struct pipe_shader_caps *)&screen->base.shader_caps[i];
++
++      /* Only vertex and fragment stages exist -- everything else stays
++       * zeroed, and max_instructions == 0 is the documented "stage
++       * unsupported" signal (p_defines.h), which also switches off the
++       * corresponding bind_*_state calls in cso_release_all. */
++      if (i != PIPE_SHADER_VERTEX && i != PIPE_SHADER_FRAGMENT)
++         continue;
++
++      caps->max_instructions =
++      caps->max_alu_instructions =
++      caps->max_tex_instructions =
++      caps->max_tex_indirections = 16384;
++      caps->max_control_flow_depth = 64;
++      caps->max_inputs = 16;
++      caps->max_outputs = 16;
++      caps->max_const_buffer0_size = 16384;
++      caps->max_const_buffers = 8;
++      caps->max_temps = 256;
++      caps->max_texture_samplers = 8;
++      caps->max_sampler_views = 8;
++      caps->max_shader_buffers = 0;
++      caps->max_shader_images = 0;
++      caps->max_hw_atomic_counters = 0;
++      caps->max_hw_atomic_counter_buffers = 0;
++      caps->integers = true;
++      caps->indirect_temp_addr = true;
++      caps->indirect_const_addr = true;
++      caps->cont_supported = true;
++      /* NIR only -- keeps nir_to_tgsi (and its nir_lower_bool_to_int32
++       * call) out of the picture entirely, per nir_opcode_triage.md. */
++      caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
++   }
++}
++
++static void
++mgc_init_compute_caps(struct mgc_screen *screen)
++{
++   /* No compute support in this ISA (no compute shader stage in
++    * isa.yaml). Leave struct pipe_compute_caps zeroed. */
++}
++
++static void
++mgc_init_screen_caps(struct mgc_screen *screen)
++{
++   struct pipe_caps *caps = (struct pipe_caps *)&screen->base.caps;
++
++   u_init_pipe_screen_caps(&screen->base, 0);
++
++   /* The two caps compute_version_es2() actually checks for beyond the
++    * two always-on extensions (src/mesa/main/version.c). Get these wrong
++    * and eglCreateContext fails silently with ctx->Version == 0. */
++   caps->npot_textures = true;
++   caps->blend_equation_separate = true;
++
++   caps->max_render_targets = 1;
++   caps->max_texture_2d_size = 2048;
++   caps->max_texture_3d_levels = 8;
++   caps->max_texture_cube_levels = 12;
++   caps->mixed_color_depth_bits = true;
++
++   /* Assumed true so cso_context doesn't layer u_vbuf on top of our
++    * resource stubs (st_context.c passes CSO_NO_64B_VERTEX_BUFFERS for
++    * GLES2, implying user vertex buffers). */
++   caps->user_vertex_buffers = true;
++
++   /* True so glLinkProgram compiles the default FS variant eagerly
++    * instead of deferring to first draw -- that's what makes
++    * create_fs_state actually run for these test shaders, which never
++    * draw. */
++   caps->shareable_shaders = true;
++
++   caps->glsl_feature_level = caps->glsl_feature_level_compatibility = 120;
++   caps->vendor_id = caps->device_id = 0xFFFFFFFF;
++
++   caps->compute = false;
++}
++
++static void
++mgc_destroy_screen(struct pipe_screen *screen)
++{
++   FREE(mgc_screen(screen));
++}
++
++static void
++mgc_flush_frontbuffer(struct pipe_screen *screen,
++                       struct pipe_context *pipe,
++                       struct pipe_resource *resource,
++                       unsigned level, unsigned layer,
++                       void *context_private,
++                       unsigned nboxes,
++                       struct pipe_box *sub_box)
++{
++   /* No presentation path -- see mgc_screen.h scope note. */
++}
++
++static int
++mgc_screen_get_fd(struct pipe_screen *screen)
++{
++   return -1;
++}
++
++static char *
++mgc_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
++{
++   /* Returning NULL means "no error" -- a non-NULL ralloc'd string here
++    * makes glLinkProgram fail with our message instead of a crash. The
++    * real translation/validation work happens in mgc_compile_nir(),
++    * called from create_fs_state/create_vs_state (mgc_context.c), which
++    * runs after this hook. */
++   return NULL;
++}
++
++/* No real fence/sync object exists yet -- nothing is ever submitted to
++ * anything (see docs/driver/gallium-integration.md section 3), so there
++ * is nothing to refcount either. Matches softpipe's sw_winsys fence path
++ * (sp_fence.c) exactly: fences are untyped opaque pointers the driver
++ * never dereferences. */
++static void
++mgc_fence_reference(struct pipe_screen *screen,
++                     struct pipe_fence_handle **ptr,
++                     struct pipe_fence_handle *fence)
++{
++   *ptr = fence;
++}
++
++static bool
++mgc_fence_finish(struct pipe_screen *screen,
++                  struct pipe_context *ctx,
++                  struct pipe_fence_handle *fence,
++                  uint64_t timeout)
++{
++   /* Nothing is ever actually outstanding -- every op so far is
++    * synchronous (or a no-op). Always signaled. */
++   return true;
++}
++
++struct pipe_screen *
++mgc_create_screen(struct sw_winsys *winsys)
++{
++   struct mgc_screen *screen = CALLOC_STRUCT(mgc_screen);
++
++   if (!screen)
++      return NULL;
++
++   screen->winsys = winsys;
++
++   screen->base.destroy = mgc_destroy_screen;
++   screen->base.get_name = mgc_get_name;
++   screen->base.get_vendor = mgc_get_vendor;
++   screen->base.get_device_vendor = mgc_get_vendor;
++   screen->base.get_screen_fd = mgc_screen_get_fd;
++   screen->base.get_timestamp = u_default_get_timestamp;
++   screen->base.is_format_supported = mgc_is_format_supported;
++   screen->base.context_create = mgc_create_context;
++   screen->base.flush_frontbuffer = mgc_flush_frontbuffer;
++   screen->base.get_compiler_options = mgc_get_compiler_options;
++   screen->base.finalize_nir = mgc_finalize_nir;
++   screen->base.fence_reference = mgc_fence_reference;
++   screen->base.fence_finish = mgc_fence_finish;
++
++   mgc_init_screen_resource_funcs(&screen->base);
++
++   mgc_init_shader_caps(screen);
++   mgc_init_compute_caps(screen);
++   mgc_init_screen_caps(screen);
++
++   return &screen->base;
++}
+diff --git a/src/gallium/drivers/mgc/mgc_screen.h b/src/gallium/drivers/mgc/mgc_screen.h
+new file mode 100644
+index 0000000..c2b9f81
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_screen.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc: a software-winsys Gallium driver skeleton for the MGC-FP16-v1
++ * micro-GPU (target FPGA, not yet fabricated -- see /docs/isa/isa.yaml).
++ * Modeled on softpipe (src/gallium/drivers/softpipe/) but stripped to the
++ * minimum needed to reach shader compilation: no rasterization, no real
++ * resource storage, no draw module. See docs/driver/gallium-integration.md
++ * and the Weeks 1-4 plan for scope.
++ */
++#ifndef MGC_SCREEN_H
++#define MGC_SCREEN_H
++
++#include "pipe/p_screen.h"
++
++struct sw_winsys;
++
++struct mgc_screen {
++   struct pipe_screen base;
++   struct sw_winsys *winsys;
++};
++
++static inline struct mgc_screen *
++mgc_screen(struct pipe_screen *pscreen)
++{
++   return (struct mgc_screen *)pscreen;
++}
++
++#endif
+diff --git a/src/gallium/drivers/mgc/mgc_state.c b/src/gallium/drivers/mgc/mgc_state.c
+new file mode 100644
+index 0000000..4dcd45a
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_state.c
+@@ -0,0 +1,296 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_state.c -- trivial state-object plumbing. None of this state is
++ * ever consulted (there is no rasterizer, no blend unit, nothing that
++ * draws) -- it exists purely so cso_context has non-NULL hooks to call.
++ * See src/gallium/auxiliary/cso_cache/cso_context.c: cso_release_all()
++ * calls the bind_* hooks below unconditionally at context teardown with
++ * no NULL checks, which is what makes stubbing "just the ones we use"
++ * unsafe -- this file implements the full required set up front instead.
++ */
++
++#include "util/u_debug_cb.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++#include "util/u_sampler.h"
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++
++#include "mgc_context.h"
++
++/* ---- Trivial CALLOC/FREE state objects: contents are never read. ---- */
++
++static void
++mgc_bind_dummy_state(struct pipe_context *pipe, void *state)
++{
++}
++
++static void
++mgc_delete_dummy_state(struct pipe_context *pipe, void *state)
++{
++   FREE(state);
++}
++
++static void
++mgc_bind_sampler_states(struct pipe_context *pipe,
++                         enum pipe_shader_type shader,
++                         unsigned start_slot, unsigned num_samplers,
++                         void **samplers)
++{
++}
++
++static void *
++mgc_create_blend_state(struct pipe_context *pipe,
++                        const struct pipe_blend_state *state)
++{
++   return CALLOC(1, 1);
++}
++
++static void *
++mgc_create_sampler_state(struct pipe_context *pipe,
++                          const struct pipe_sampler_state *state)
++{
++   return CALLOC(1, 1);
++}
++
++static void *
++mgc_create_rasterizer_state(struct pipe_context *pipe,
++                             const struct pipe_rasterizer_state *state)
++{
++   return CALLOC(1, 1);
++}
++
++static void *
++mgc_create_depth_stencil_alpha_state(struct pipe_context *pipe,
++                                      const struct pipe_depth_stencil_alpha_state *state)
++{
++   return CALLOC(1, 1);
++}
++
++static void *
++mgc_create_vertex_elements_state(struct pipe_context *pipe,
++                                  unsigned num_elements,
++                                  const struct pipe_vertex_element *elements)
++{
++   return CALLOC(1, 1);
++}
++
++/* ---- Sampler views: minimal, never actually sampled from. ---- */
++
++static struct pipe_sampler_view *
++mgc_create_sampler_view(struct pipe_context *pipe,
++                         struct pipe_resource *texture,
++                         const struct pipe_sampler_view *templat)
++{
++   struct pipe_sampler_view *view = CALLOC_STRUCT(pipe_sampler_view);
++
++   if (!view)
++      return NULL;
++
++   *view = *templat;
++   view->reference.count = 1;
++   view->texture = NULL;
++   pipe_resource_reference(&view->texture, texture);
++   view->context = pipe;
++   return view;
++}
++
++static void
++mgc_sampler_view_destroy(struct pipe_context *pipe,
++                          struct pipe_sampler_view *view)
++{
++   pipe_resource_reference(&view->texture, NULL);
++   FREE(view);
++}
++
++
++/* ---- set_* parameter state: nothing consumes these yet. ---- */
++
++static void
++mgc_set_stencil_ref(struct pipe_context *pipe,
++                     const struct pipe_stencil_ref ref)
++{
++}
++
++static void
++mgc_set_sample_mask(struct pipe_context *pipe, unsigned sample_mask)
++{
++}
++
++static void
++mgc_set_clip_state(struct pipe_context *pipe,
++                    const struct pipe_clip_state *state)
++{
++}
++
++static void
++mgc_set_constant_buffer(struct pipe_context *pipe,
++                         enum pipe_shader_type shader, unsigned index,
++                         bool take_ownership,
++                         const struct pipe_constant_buffer *buf)
++{
++   /* Nothing downstream consumes constant buffers yet, so nothing is
++    * stored per-slot. If the caller transferred ownership of a reference
++    * to us (take_ownership), we must still drop it here or it leaks. */
++   if (take_ownership && buf && buf->buffer) {
++      struct pipe_resource *res = buf->buffer;
++      pipe_resource_reference(&res, NULL);
++   }
++}
++
++static void
++mgc_set_framebuffer_state(struct pipe_context *pipe,
++                           const struct pipe_framebuffer_state *state)
++{
++}
++
++static void
++mgc_set_polygon_stipple(struct pipe_context *pipe,
++                         const struct pipe_poly_stipple *state)
++{
++}
++
++static void
++mgc_set_scissor_states(struct pipe_context *pipe,
++                        unsigned start_slot, unsigned num_scissors,
++                        const struct pipe_scissor_state *state)
++{
++}
++
++static void
++mgc_set_viewport_states(struct pipe_context *pipe,
++                         unsigned start_slot, unsigned num_viewports,
++                         const struct pipe_viewport_state *state)
++{
++}
++
++static void
++mgc_set_sampler_views(struct pipe_context *pipe,
++                       enum pipe_shader_type shader,
++                       unsigned start_slot, unsigned num_views,
++                       unsigned unbind_num_trailing_slots,
++                       struct pipe_sampler_view **views)
++{
++}
++
++static void
++mgc_set_shader_buffers(struct pipe_context *pipe,
++                        enum pipe_shader_type shader,
++                        unsigned start_slot, unsigned count,
++                        const struct pipe_shader_buffer *buffers,
++                        unsigned writable_bitmask)
++{
++}
++
++static void
++mgc_set_shader_images(struct pipe_context *pipe,
++                       enum pipe_shader_type shader,
++                       unsigned start_slot, unsigned count,
++                       unsigned unbind_num_trailing_slots,
++                       const struct pipe_image_view *images)
++{
++}
++
++static void
++mgc_set_vertex_buffers(struct pipe_context *pipe,
++                        unsigned count,
++                        const struct pipe_vertex_buffer *buffers)
++{
++}
++
++/* ---- Rendering entry points: never exercised (no draws in Weeks 1-4's
++ * surfaceless-EGL scope), but must be non-NULL. ---- */
++
++static void
++mgc_draw_vbo(struct pipe_context *pipe,
++             const struct pipe_draw_info *info,
++             unsigned drawid_offset,
++             const struct pipe_draw_indirect_info *indirect,
++             const struct pipe_draw_start_count_bias *draws,
++             unsigned num_draws)
++{
++}
++
++static void
++mgc_clear(struct pipe_context *pipe,
++          unsigned buffers,
++          const struct pipe_scissor_state *scissor_state,
++          const union pipe_color_union *color,
++          double depth,
++          unsigned stencil)
++{
++}
++
++static void
++mgc_flush(struct pipe_context *pipe,
++          struct pipe_fence_handle **fence,
++          unsigned flags)
++{
++   /* Nothing was ever batched -- there is no fence to hand back other
++    * than an always-signaled placeholder. */
++   if (fence)
++      pipe->screen->fence_reference(pipe->screen, fence, NULL);
++}
++
++static void
++mgc_texture_barrier(struct pipe_context *pipe, unsigned flags)
++{
++}
++
++static void
++mgc_memory_barrier(struct pipe_context *pipe, unsigned flags)
++{
++}
++
++void
++mgc_init_state_funcs(struct pipe_context *pipe)
++{
++   pipe->create_blend_state = mgc_create_blend_state;
++   pipe->bind_blend_state = mgc_bind_dummy_state;
++   pipe->delete_blend_state = mgc_delete_dummy_state;
++
++   pipe->create_sampler_state = mgc_create_sampler_state;
++   pipe->bind_sampler_states = mgc_bind_sampler_states;
++   pipe->delete_sampler_state = mgc_delete_dummy_state;
++
++   pipe->create_rasterizer_state = mgc_create_rasterizer_state;
++   pipe->bind_rasterizer_state = mgc_bind_dummy_state;
++   pipe->delete_rasterizer_state = mgc_delete_dummy_state;
++
++   pipe->create_depth_stencil_alpha_state = mgc_create_depth_stencil_alpha_state;
++   pipe->bind_depth_stencil_alpha_state = mgc_bind_dummy_state;
++   pipe->delete_depth_stencil_alpha_state = mgc_delete_dummy_state;
++
++   pipe->create_vertex_elements_state = mgc_create_vertex_elements_state;
++   pipe->bind_vertex_elements_state = mgc_bind_dummy_state;
++   pipe->delete_vertex_elements_state = mgc_delete_dummy_state;
++
++   pipe->create_sampler_view = mgc_create_sampler_view;
++   pipe->sampler_view_destroy = mgc_sampler_view_destroy;
++   /* Matches softpipe (sp_state_sampler.c): must tolerate a NULL view --
++    * st_destroy_context() calls it unconditionally on a handful of
++    * st-internal cached views (e.g. st->pixel_xfer.pixelmap_sampler_view)
++    * that are NULL whenever the corresponding feature was never used. */
++   pipe->sampler_view_release = u_default_sampler_view_release;
++
++   pipe->set_stencil_ref = mgc_set_stencil_ref;
++   pipe->set_sample_mask = mgc_set_sample_mask;
++   pipe->set_clip_state = mgc_set_clip_state;
++   pipe->set_constant_buffer = mgc_set_constant_buffer;
++   pipe->set_framebuffer_state = mgc_set_framebuffer_state;
++   pipe->set_polygon_stipple = mgc_set_polygon_stipple;
++   pipe->set_scissor_states = mgc_set_scissor_states;
++   pipe->set_viewport_states = mgc_set_viewport_states;
++   pipe->set_sampler_views = mgc_set_sampler_views;
++   pipe->set_shader_buffers = mgc_set_shader_buffers;
++   pipe->set_shader_images = mgc_set_shader_images;
++   pipe->set_vertex_buffers = mgc_set_vertex_buffers;
++   pipe->set_debug_callback = u_default_set_debug_callback;
++
++   pipe->draw_vbo = mgc_draw_vbo;
++   pipe->clear = mgc_clear;
++   pipe->flush = mgc_flush;
++   pipe->texture_barrier = mgc_texture_barrier;
++   pipe->memory_barrier = mgc_memory_barrier;
++}
+diff --git a/src/gallium/drivers/mgc/mgc_test_arith.c b/src/gallium/drivers/mgc/mgc_test_arith.c
+new file mode 100644
+index 0000000..92c34a9
+--- /dev/null
++++ b/src/gallium/drivers/mgc/mgc_test_arith.c
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * mgc_test_arith.c -- standalone unit test for mgc_compile_nir(), driving
++ * it directly through nir_builder rather than through GLSL. This is
++ * deliberate, not a shortcut: GLSL constant-folds pure-literal arithmetic
++ * before it ever reaches a driver's create_fs_state (confirmed by
++ * shaders/05_loop's trace in docs/glsl-to-nir/dictionary.md, which
++ * collapsed a whole loop to one constant), and Weeks 1-4's backend has no
++ * uniform/attribute support to route a non-constant value through
++ * instead (those are load_ubo_vec4/load_input intrinsics, explicitly out
++ * of scope -- see docs/isa/nir_opcode_triage.md). Building the NIR by
++ * hand is the standard way to unit-test a compiler backend in isolation,
++ * and it's the only way to exercise a real multi-instruction fadd16/
++ * fmul16/fdiv16 chain (plus the wait_* insertion between them) for this
++ * phase. See the Weeks 1-4 plan, Phase 4 verification.
++ *
++ * Computes (2.0 * 3.0 + 0.5) / 2.0 = 3.25 and stores it to
++ * gl_FragColor.r, matching the numeric check in tests/test_backend_e2e.py.
++ */
++
++#include <stdio.h>
++
++#include "compiler/nir/nir.h"
++#include "compiler/nir/nir_builder.h"
++#include "compiler/shader_enums.h"
++
++#include "mgc_compiler.h"
++
++int
++main(void)
++{
++   const struct nir_shader_compiler_options *options =
++      mgc_test_get_compiler_options();
++
++   nir_builder b =
++      nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, options, "mgc_arith_test");
++
++   nir_def *two_a = nir_imm_float(&b, 2.0f);
++   nir_def *three = nir_imm_float(&b, 3.0f);
++   nir_def *product = nir_fmul(&b, two_a, three); /* 6.0 */
++
++   nir_def *half = nir_imm_float(&b, 0.5f);
++   nir_def *sum = nir_fadd(&b, product, half); /* 6.5 */
++
++   nir_def *two_b = nir_imm_float(&b, 2.0f);
++   nir_def *quotient = nir_fdiv(&b, sum, two_b); /* 3.25 */
++
++   nir_def *offset = nir_imm_int(&b, 0);
++   nir_store_output(&b, quotient, offset, .component = 0);
++
++   struct mgc_shader *shader = mgc_compile_nir(b.shader);
++
++   if (shader->error) {
++      fprintf(stderr, "mgc_test_arith: %s\n", shader->error);
++      mgc_shader_destroy(shader);
++      return 1;
++   }
++
++   fputs(shader->asm_text, stdout);
++   mgc_shader_destroy(shader);
++   return 0;
++}
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index c26e98e..5349a43 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -59,17 +59,14 @@ if with_any_llvmpipe
+ else
+   driver_llvmpipe = declare_dependency()
+ endif
+-if with_any_llvmpipe and with_gallium_softpipe
+-  driver_swrast = declare_dependency(
+-    dependencies : [ driver_softpipe, driver_llvmpipe ],
+-  )
+-elif with_any_llvmpipe
+-  driver_swrast = driver_llvmpipe
+-elif with_gallium_softpipe
+-  driver_swrast = driver_softpipe
++if with_gallium_mgc
++  subdir('drivers/mgc')
+ else
+-  driver_swrast = declare_dependency()
++  driver_mgc = declare_dependency()
+ endif
++driver_swrast = declare_dependency(
++  dependencies : [driver_softpipe, driver_llvmpipe, driver_mgc],
++)
+ 
+ if with_gallium_asahi
+   subdir('winsys/asahi/drm')
+-- 
+2.43.0
+

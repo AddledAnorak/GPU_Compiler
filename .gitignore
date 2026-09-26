@@ -1,0 +1,27 @@
+# Python virtualenv
+.venv/
+
+# Upstream Mesa checkout (tracked separately, see mesa-patches/)
+mesa/
+
+# Python bytecode / test caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated NIR traces (regenerate via tools/dump_nir.sh)
+docs/glsl-to-nir/traces/
+
+# Compiled harness binaries
+tools/nir_dump_harness
+tools/mgc_harness
+
+# Generated MGC assembly dumps (but keep committed test fixtures)
+*.asm
+!tests/fixtures/*.asm
+
+# Local ISA notes
+docs/isa/**/*.md
+
+# Local progress recording notes
+docs/progress_demo_recording.md
