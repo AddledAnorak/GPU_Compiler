@@ -21,15 +21,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from mgcasm.fp16 import (
-    fp16_add,
-    fp16_bits_to_float,
-    fp16_div,
-    fp16_mul,
-    fp16_sub,
-    float_to_fp16_bits,
-)
-from mgcasm.isa import ISA
+if __package__ == "mgcsim":
+    from mgcasm.fp16 import (
+        fp16_add, fp16_bits_to_float, fp16_div, fp16_mul, fp16_sub, float_to_fp16_bits,
+    )
+    from mgcasm.isa import ISA
+else:
+    from tools.mgcasm.fp16 import (
+        fp16_add, fp16_bits_to_float, fp16_div, fp16_mul, fp16_sub, float_to_fp16_bits,
+    )
+    from tools.mgcasm.isa import ISA
 
 from .memory import Memory
 
@@ -147,7 +148,11 @@ class CPU:
         channel = self._channel_of(opcode)
 
         if channel == 22:
-            self._exec_direct_branch(word, channel)
+            if self._condition_passes(word):
+                self._exec_direct_branch(word, channel)
+            else:
+                self.pc += 1
+            self.pending_hi = dict(_NO_HI)
             return
 
         subop = f["subop"].extract(word)
@@ -190,17 +195,10 @@ class CPU:
         # Conditional execution gate. Reading the CR itself is checked for
         # hazards; a false predicate skips all effects but still retires
         # the one-shot regbank state and advances PC.
-        cond_enable = f["cond_enable"].extract(word)
-        if cond_enable:
-            cond_invert = f["cond_invert"].extract(word)
-            cond_cr = f["cond_cr"].extract(word)
-            predicate = self._get_cr(cond_cr)
-            if cond_invert:
-                predicate = not predicate
-            if not predicate:
-                self.pending_hi = dict(_NO_HI)
-                self.pc += 1
-                return
+        if not self._condition_passes(word):
+            self.pending_hi = dict(_NO_HI)
+            self.pc += 1
+            return
 
         self._exec(mnem, word)
         # every non-branch path above either returns early or falls
@@ -208,6 +206,13 @@ class CPU:
         if mnem not in ("jump", "rcall", "ret", "stop_core"):
             self.pc += 1
         self.pending_hi = dict(_NO_HI)
+
+    def _condition_passes(self, word: int) -> bool:
+        fields = self.isa.fields
+        if not fields["cond_enable"].extract(word):
+            return True
+        predicate = self._get_cr(fields["cond_cr"].extract(word))
+        return not predicate if fields["cond_invert"].extract(word) else predicate
 
     def _resolve_reg_field(self, field_value: int, slot: str) -> int:
         hi = self.pending_hi.get(slot, False)
@@ -443,6 +448,8 @@ class CPU:
         f = self.isa.fields
         subop = f["subop"].extract(word)
         mnem = self.isa.mnemonic_for(channel, subop)
+        if mnem not in ("goto", "call"):
+            raise MgcSimError(f"channel {channel} has no direct branch at subop {subop}")
         hi6 = (f["srcA_select"].extract(word) << 5) | f["srcA"].extract(word)
         lo10 = (f["srcB"].extract(word) << 5) | f["dst"].extract(word)
         raw = (hi6 << 10) | lo10

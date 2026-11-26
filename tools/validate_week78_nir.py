@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Check the Week 7-8 Phong and texture claims against fresh softpipe NIR dumps.
+"""Phong/texture contracts and compatibility entry point for fresh validation.
 
-Run tools/dump_nir.sh first. Its full dumps are intentionally Git-ignored;
-this checker makes the small, documented observations reproducible.
+The CLI now regenerates every pair, including the later flow/trig examples.
+An optional positional trace directory selects the destination, not cached input.
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ def require(condition: bool, message: str) -> None:
 def snapshots(text: str, stage: str) -> list[str]:
     markers = list(STAGE.finditer(text))
     result = []
-    for i, marker in enumerate(markers):
+    for index, marker in enumerate(markers):
         if marker.group(1) == stage:
-            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
             result.append(text[marker.start():end])
     require(result, f"no {stage.lower()} NIR snapshots")
     return result
@@ -101,22 +101,12 @@ def validate_texture(text: str) -> str:
 
 
 def main(trace_dir: Path) -> int:
-    for name, validate in (("07_lighting_phong", validate_phong),
-                           ("08_texture", validate_texture)):
-        path = trace_dir / f"{name}.nir.txt"
-        if not path.is_file():
-            print(f"FAIL {name}: missing {path}; run tools/dump_nir.sh", file=sys.stderr)
-            return 1
-        text = path.read_text(errors="replace")
-        try:
-            require("shader compile failed" not in text and "link failed" not in text,
-                    "GLSL compilation or linking failed")
-            print(f"PASS {name}: {validate(text)}")
-        except ValueError as error:
-            print(f"FAIL {name}: {error}", file=sys.stderr)
-            return 1
-    return 0
+    from validate_frontend import main as validate_fresh
+
+    return validate_fresh(["--trace-dir", str(trace_dir)])
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 2:
+        raise SystemExit("usage: validate_week78_nir.py [output_trace_dir]")
     raise SystemExit(main(Path(sys.argv[1]) if len(sys.argv) == 2 else DEFAULT_TRACES))

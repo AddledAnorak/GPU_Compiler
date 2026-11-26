@@ -1,0 +1,103 @@
+{
+  "manifest_version": 1,
+  "device": {
+    "identity": null,
+    "identity_ref": null,
+    "access": null,
+    "access_ref": null,
+    "ownership_ref": null
+  },
+  "maps": [
+    {
+      "name": null,
+      "index": null,
+      "size": null,
+      "offset": null,
+      "page_size": null,
+      "mapping_ref": null
+    }
+  ],
+  "windows": {
+    "program": {
+      "map": null,
+      "byte_offset": null,
+      "size": null,
+      "gpu_byte_base": null,
+      "reservation": {
+        "byte_offset": null,
+        "size": null,
+        "reference": null
+      }
+    },
+    "data": {
+      "map": null,
+      "byte_offset": null,
+      "size": null,
+      "gpu_byte_base": null,
+      "reservation": {
+        "byte_offset": null,
+        "size": null,
+        "reference": null
+      }
+    },
+    "registers": {
+      "map": null,
+      "byte_offset": null,
+      "size": null,
+      "reservation": {
+        "byte_offset": null,
+        "size": null,
+        "reference": null
+      }
+    }
+  },
+  "mmio": {
+    "memory_base": null,
+    "memory_size": null,
+    "program_base": null,
+    "program_capacity": null,
+    "control_offset": null,
+    "status_offset": null,
+    "entry_offset": null,
+    "word_count_offset": null,
+    "start_value": null,
+    "busy_mask": null,
+    "done_mask": null,
+    "error_mask": null,
+    "acknowledge_offset": null,
+    "acknowledge_value": null,
+    "abort_offset": null,
+    "abort_value": null,
+    "byteorder": null
+  },
+  "abi": {
+    "program_format": null,
+    "program_word_bits": null,
+    "register_width_bits": null,
+    "register_byteorder": null,
+    "entry_units": null,
+    "entry_register_units": null,
+    "count_register_units": null
+  },
+  "submission": {
+    "program_word_count": null,
+    "entry_word": null
+  },
+  "contracts": {
+    "read32_ref": null,
+    "write32_ref": null,
+    "read_ref": null,
+    "write_ref": null,
+    "sync_for_device_ref": null,
+    "sync_for_cpu_ref": null,
+    "barrier_ref": null,
+    "coherency_ref": null,
+    "bounded_io_ref": null,
+    "start_acceptance_ref": null,
+    "acknowledgement_ref": null,
+    "completion_ref": null,
+    "idle_writes_drained_ref": null,
+    "stop_policy": null,
+    "stop_ref": null
+  }
+}

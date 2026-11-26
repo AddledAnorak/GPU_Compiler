@@ -27,6 +27,58 @@ def run(src: str, max_cycles=1000) -> CPU:
     return cpu
 
 
+@pytest.mark.parametrize("condition", ["cr", "ncr"])
+@pytest.mark.parametrize("predicate", [False, True])
+def test_direct_goto_checks_predicate_and_inversion(condition, predicate):
+    cpu = run(f"""
+        movi_f16 {1.0 if predicate else 0.0}, r0
+        fcomp_e #3, r0, cr0
+        wait_fcomp
+        goto.{condition}0 taken
+        copy #3, r1
+        stop_core
+        taken: copy #4, r1
+        stop_core
+    """)
+    taken = predicate if condition == "cr" else not predicate
+    assert cpu.regs[1] == float_to_fp16_bits(0.5 if taken else 1.0)
+
+
+@pytest.mark.parametrize("condition", ["cr", "ncr"])
+@pytest.mark.parametrize("predicate", [False, True])
+def test_direct_call_only_pushes_return_when_predicate_passes(condition, predicate):
+    cpu = CPU(isa=isa)
+    cpu.cr[2] = predicate
+    cpu.run(assemble(f"""
+        call.{condition}2 subroutine
+        stop_core
+        subroutine: copy #3, r1
+        ret
+    """, isa))
+    taken = predicate if condition == "cr" else not predicate
+    assert cpu.regs[1] == (float_to_fp16_bits(1.0) if taken else 0)
+    assert cpu.call_stack == []
+
+
+@pytest.mark.parametrize("mnemonic", ["goto", "call"])
+@pytest.mark.parametrize("condition", ["cr", "ncr"])
+def test_direct_branch_predicate_requires_comparison_wait(mnemonic, condition):
+    with pytest.raises(LatencyViolation, match="cr0"):
+        run(f"movi_f16 0, r0\nfcomp_e #3, r0, cr0\n{mnemonic}.{condition}0 0\nstop_core")
+
+
+@pytest.mark.parametrize("mnemonic", ["goto", "call"])
+@pytest.mark.parametrize("predicate", [False, True])
+def test_direct_branch_retires_one_shot_register_bank(mnemonic, predicate):
+    cpu = CPU(isa=isa)
+    cpu.cr[0] = predicate
+    for word in assemble(f"regbank 1, 1, 1\n{mnemonic}.cr0 3", isa):
+        cpu.step(word)
+    assert cpu.pc == (5 if predicate else 2)
+    assert cpu.pending_hi == {"srcA": False, "srcB": False, "dst": False}
+    assert cpu.call_stack == ([2] if predicate and mnemonic == "call" else [])
+
+
 # ---------------------------------------------------------------------
 # FP16 bit-exactness against numpy.float16, including the constant bank
 # ---------------------------------------------------------------------

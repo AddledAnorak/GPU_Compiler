@@ -15,13 +15,18 @@ docs/glsl-to-nir/traces/
 # Compiled harness binaries
 tools/nir_dump_harness
 tools/mgc_harness
+tools/render_phong_demo
 
 # Generated MGC assembly dumps (but keep committed test fixtures)
 *.asm
 !tests/fixtures/*.asm
 
-# Local ISA notes
-docs/isa/**/*.md
+# Local hardware datasets and compiled outputs
+/hardware-examples/
+/interpreter/lib/
+/interpreter/**/*.o
+/interpreter/**/*.exe
+/assets/teapot/teapot.host.*
 
-# Local progress recording notes
-docs/progress_demo_recording.md
+# Reproducible validation and demo outputs
+artifacts/

@@ -65,13 +65,21 @@ class Disassembler:
             # decodes normally below.
             subop = f["subop"].extract(word)
             mnem = isa.mnemonic_for(channel, subop)
+            if mnem not in ("goto", "call"):
+                raise DisasmError(f"channel {channel} has no direct branch at subop {subop}")
             hi6 = (f["srcA_select"].extract(word) << 5) | f["srcA"].extract(word)
             lo10 = (f["srcB"].extract(word) << 5) | f["dst"].extract(word)
             raw = (hi6 << 10) | lo10
             width = isa.control_flow_target_width
             if raw & (1 << (width - 1)):
                 raw -= 1 << width
-            return DecodedInstr(mnem, f"{mnem} {raw}", channel, subop, False, False, 0), dict(_NO_HI)
+            cond_enable = bool(f["cond_enable"].extract(word))
+            cond_invert = bool(f["cond_invert"].extract(word))
+            cond_cr = f["cond_cr"].extract(word)
+            suffix = f".{'ncr' if cond_invert else 'cr'}{cond_cr}" if cond_enable else ""
+            decoded = DecodedInstr(mnem, f"{mnem}{suffix} {raw}", channel, subop,
+                                   cond_enable, cond_invert, cond_cr)
+            return decoded, dict(_NO_HI)
 
         subop = f["subop"].extract(word)
         mnem = isa.mnemonic_for(channel, subop)

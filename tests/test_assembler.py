@@ -72,6 +72,14 @@ def test_conditional_execution_normal_and_inverted():
     roundtrip("fadd16.ncr3 r1, r2, r3")
 
 
+@pytest.mark.parametrize("mnemonic", ["goto", "call"])
+@pytest.mark.parametrize("condition", ["cr", "ncr"])
+@pytest.mark.parametrize("register", range(8))
+@pytest.mark.parametrize("offset", [-32768, -1, 0, 22, 32767])
+def test_direct_branch_predicates_roundtrip(mnemonic, condition, register, offset):
+    roundtrip(f"{mnemonic}.{condition}{register} {offset}")
+
+
 def test_constant_bank_operand_by_index_and_name():
     roundtrip("fadd16 #3, r2, r3")
     roundtrip("fmul16 #one, r2, r3")
